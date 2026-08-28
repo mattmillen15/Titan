@@ -39,7 +39,7 @@ else
     echo "[*] .NET 8 not found — installing..."
     command -v curl &>/dev/null || { echo "[!] curl required to install .NET" >&2; exit 1; }
     TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
-    curl -fsSL https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
+    curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
     chmod +x "${TMP_DOTNET_INSTALL}"
     # Strip set -u — hits unbound associative array key on some bash versions
     sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
@@ -75,7 +75,7 @@ if [[ -z "${TITANIS_ROOT}" ]]; then
     command -v unzip &>/dev/null || { echo "[!] unzip required" >&2; exit 1; }
 
     TMP_ZIP="/tmp/Titanis-linux-x64-$$.zip"
-    curl -fL --progress-bar -o "${TMP_ZIP}" "${TITANIS_DOWNLOAD_URL}"
+    curl -fLk --progress-bar -o "${TMP_ZIP}" "${TITANIS_DOWNLOAD_URL}"
     mkdir -p "${TITANIS_INSTALL_DIR}"
     unzip -q -o "${TMP_ZIP}" -d "${TITANIS_INSTALL_DIR}"
     rm -f "${TMP_ZIP}"
