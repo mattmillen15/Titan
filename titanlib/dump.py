@@ -255,6 +255,10 @@ def parse_args():
         else:
             p.error('-k/--kerberos requires KRB5CCNAME to be set or --ccache to be given')
 
+    if args.kerberos and args.ticket_cache and not os.path.isfile(args.ticket_cache):
+        p.error(f'ccache file not found: {args.ticket_cache}\n'
+                f'  Run getST.py -spn cifs/<target> ... to obtain a service ticket')
+
     if args.kerberos and args.ticket_cache and (not args.username or not args.domain):
         _ccache_principal(args)
     if not args.username and not args.kerberos:
@@ -1965,11 +1969,12 @@ def dump_host(host, args, auth):
                 sk_raw, sk_rc = _run(REG_BIN, 'syskey', auth,
                                      [host, '-BackupSemantics'],
                                      verbose=args.verbose)
-                if sk_rc != 0 and not sk_raw.strip():
+                syskey_val = _syskey_from_output(sk_raw)
+                if syskey_val == '(not retrieved)':
                     _reg_auth_failed = True
                     _reg_fail_rc     = sk_rc
                 else:
-                    syskey_line = f'[*] SYSKEY: {_syskey_from_output(sk_raw)}'
+                    syskey_line = f'[*] SYSKEY: {syskey_val}'
                     if args.sam:   sec_sam.append(syskey_line)
                     if args.lsa:   sec_lsa.append(syskey_line)
                     if args.cache: sec_cache.append(syskey_line)
