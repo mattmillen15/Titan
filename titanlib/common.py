@@ -228,6 +228,21 @@ def apply_target_string(args, host_attr: str = 'target'):
             if host and not getattr(args, host_attr, None):
                 setattr(args, host_attr, resolve_host(host))
             return
+    # No @ — if the string looks like credentials (has / or :) treat it as
+    # domain/user:pass with the host coming from -t or -f.
+    # Otherwise treat the whole string as the host (bare hostname shorthand).
+    if '/' in ts or ':' in ts:
+        m = re.match(r'^(?:(?P<d>[^/]+)/)?(?P<u>[^:]+)(?::(?P<p>.*))?$', ts)
+        if m:
+            if m.group('d') and not getattr(args, 'domain', ''):
+                args.domain = m.group('d')
+            if m.group('u') and not getattr(args, 'username', None):
+                args.username = m.group('u')
+            pw = m.group('p')
+            if pw is not None and not getattr(args, 'password', None) \
+                    and not getattr(args, 'ntlm_hash', None):
+                args.password = pw
+            return
     if not getattr(args, host_attr, None):
         setattr(args, host_attr, resolve_host(ts))
 

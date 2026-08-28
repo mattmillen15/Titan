@@ -123,10 +123,17 @@ def _ccache_principal(args):
 
 def _parse_target_string(s):
     at = s.rfind('@')
-    if at < 0:
-        return None
-    host   = s[at + 1:]
-    prefix = s[:at]
+    if at >= 0:
+        host   = s[at + 1:]
+        prefix = s[:at]
+    else:
+        # No @host — treat as credentials-only (host comes from -t / -f)
+        # if the string looks like domain/user:pass or user:pass.
+        # A bare hostname has no / or : so falls through to return None.
+        if '/' not in s and ':' not in s:
+            return None
+        host   = None
+        prefix = s
     m = re.match(r'^(?:(?P<domain>[^/]+)/)?(?P<user>[^:]+)(?::(?P<password>.*))?$', prefix)
     if not m:
         return None
@@ -224,7 +231,8 @@ def parse_args():
             if pw is not None and not args.password and not args.ntlm_hash:
                 args.password = pw
             if host and not args.target:   args.target   = host
-        elif not args.target:
+        elif not args.target and '@' not in args.target_string:
+            # Bare hostname (no / or : ) — use as target directly
             args.target = args.target_string
 
     if args.just_dc_ntlm or args.just_dc_user:
