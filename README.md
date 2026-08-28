@@ -6,7 +6,9 @@ Wrapper for [Titanis](https://github.com/trustedsec/Titanis) .NET toolkit.
 
 ```bash
 git clone git@github.com:mattmillen15/Titan.git ~/workspace/titan
-bash ~/workspace/titan/install.sh
+```
+```bash
+bash install.sh
 ```
 
 ## Quick reference
