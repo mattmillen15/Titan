@@ -81,6 +81,13 @@ def make_env() -> dict:
 def run(binary: str, subcmd: str, auth: list, extra: list,
         verbose: bool = False, timeout: int = 90):
     """Run a Titanis binary subcommand, return (stdout, returncode)."""
+    if binary is None:
+        print(
+            f'  [!] Titanis binary not found for "{subcmd}" — '
+            'run install.sh with TITANIS_PATH set to the linux-x64 directory.',
+            file=sys.stderr,
+        )
+        return '', 127
     cmd = [binary, subcmd] + auth + extra
     if verbose:
         print(f'  >> {" ".join(cmd)}', file=sys.stderr)
