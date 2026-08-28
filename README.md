@@ -1,4 +1,4 @@
-# titan
+# Titan
 
 Wrapper for [Titanis](https://github.com/trustedsec/Titanis) .NET toolkit.  
 
