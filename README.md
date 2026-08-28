@@ -1,7 +1,6 @@
 # titan
 
-Unified AD attack CLI wrapping the [Titanis](https://github.com/trustedsec/Titanis) .NET toolkit.  
-Impacket-compatible flag interface. Titanis-native protocol layer — no LSASS touch, no agent on disk.
+Wrapper for [Titanis](https://github.com/trustedsec/Titanis) .NET toolkit.  
 
 ## Requirements
 
