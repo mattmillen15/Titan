@@ -198,7 +198,7 @@ def auth_args(args) -> list:
     elif getattr(args, 'password', None):
         a += ['-Password', args.password]
     elif getattr(args, 'no_pass', False):
-        a += ['-Password', '']
+        a += ['-Password', 'x']  # non-empty dummy; ntlmrelayx ignores NTLM material
     if getattr(args, 'kdc', None):          a += ['-Kdc',        args.kdc]
     if getattr(args, 'aes_key', None):      a += ['-AesKey',     args.aes_key]
     if getattr(args, 'tgt', None):          a += ['-Tgt',        args.tgt]
