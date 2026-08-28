@@ -2,13 +2,6 @@
 
 Wrapper for [Titanis](https://github.com/trustedsec/Titanis) .NET toolkit.  
 
-## Requirements
-
-- Titanis at `~/tools/titanis/linux-x64/` (or `export TITANIS_PATH=<path>`)
-- .NET 8 runtime
-- Python 3.8+: `pip install impacket cryptography`
-- impacket tools on PATH for `rbcd`: `addcomputer.py`, `getST.py`
-
 ## Install
 
 ```bash
