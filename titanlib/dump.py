@@ -281,6 +281,8 @@ def _auth_args(args):
     a = ['-UserName', args.username or '']
     if args.domain:
         a += ['-UserDomain', args.domain]
+    elif not getattr(args, 'kerberos', False):
+        a += ['-UserDomain', '.']
     if args.ntlm_hash:
         a += ['-NtlmHash', args.ntlm_hash]
     elif args.password:

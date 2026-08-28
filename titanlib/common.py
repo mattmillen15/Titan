@@ -183,8 +183,14 @@ def ccache_info(args):
 def auth_args(args) -> list:
     """Build the Titanis binary auth flag list from parsed args."""
     a = ['-UserName', getattr(args, 'username', None) or '']
-    if getattr(args, 'domain', ''):
-        a += ['-UserDomain', args.domain]
+    domain = getattr(args, 'domain', '')
+    if domain:
+        a += ['-UserDomain', domain]
+    elif not getattr(args, 'kerberos', False):
+        # No domain + no Kerberos = local account. Pass '.' so Titanis stays in
+        # NTLM and doesn't attempt Kerberos against the target's DNS suffix
+        # (which fails for local accounts when target is a FQDN).
+        a += ['-UserDomain', '.']
     ntlm_hash = getattr(args, 'ntlm_hash', None)
     if ntlm_hash:
         nt = ntlm_hash.split(':', 1)[1] if ':' in ntlm_hash else ntlm_hash
