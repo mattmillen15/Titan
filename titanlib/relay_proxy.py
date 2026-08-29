@@ -255,9 +255,8 @@ _relay_conf_path: str = ''
 
 
 def _find_proxychains_conf() -> str:
-    env_conf = os.environ.get('PROXYCHAINS_CONF_FILE', '')
-    if env_conf and os.path.isfile(env_conf):
-        return env_conf
+    # Skip PROXYCHAINS_CONF_FILE — it may already be our own patched temp file
+    # from a prior invocation. Look for the system conf directly.
     for p in [os.path.expanduser('~/.proxychains/proxychains.conf'),
               '/etc/proxychains4.conf', '/etc/proxychains.conf']:
         if os.path.isfile(p):
@@ -339,7 +338,11 @@ def activate_relay_mode() -> dict:
               'credit fix inactive', file=sys.stderr)
         return {}
 
-    relay_host, relay_port = _parse_socks5_upstream(conf)
+    # Always target ntlmrelayx at its default SOCKS port (1080), regardless of
+    # what the proxychains conf says. The conf may have been previously changed
+    # to point at our own relay-proxy port — reading it would cause a loop.
+    relay_host = '127.0.0.1'
+    relay_port = int(os.environ.get('NTLMRELAYX_SOCKS_PORT', '1080'))
 
     try:
         listen_port = _pick_free_port(1082)
