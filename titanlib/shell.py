@@ -138,10 +138,11 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     if verbose:
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
 
-    # -PreferSmb: force named-pipe transport (port 445 only, no TCP/135).
-    # -UseTcp4Only: Titanis resolves hostnames and may get AAAA records first;
-    # proxychains only hooks AF_INET connect(), so IPv6 bypasses it and fails.
-    _sf = ['-PreferSmb', '-UseTcp4Only']
+    # -PreferSmb forces named-pipe transport (port 445 only, no TCP/135).
+    # Do NOT add -UseTcp4Only here — Titanis' ResolveStaticAsync fails when
+    # forced to filter to AF_INET only; without the flag it resolves both
+    # A+AAAA and falls through to IPv4 correctly under proxychains.
+    _sf = ['-PreferSmb']
 
     _, rc = run(SCM, 'create', auth,
                 [host, svc_name, bin_path, '-Start'] + _sf,
@@ -169,12 +170,12 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
         run(SCM, 'stop', auth, [host, svc_name] + _sf,
             verbose=verbose, timeout=15)
 
-    # Retrieve output file via SMB. Use IP in UNC path to skip DFS referral
-    # lookups (DFS contacts the DC on LDAP/389 which ntlmrelayx can't relay).
+    # Use resolved IP in UNC path to skip DFS referral lookups — DFS contacts
+    # the DC on LDAP/389 which ntlmrelayx can't relay ("no handler for port").
     result    = ''
     local_tmp = tempfile.mktemp(suffix='.txt')
     out, rc = run(SMB, 'get', auth,
-                  [out_unc, local_tmp, '-Overwrite', '-UseTcp4Only'],
+                  [out_unc, local_tmp, '-Overwrite'],
                   verbose=verbose, timeout=30)
     if rc == 0 and os.path.exists(local_tmp):
         try:
@@ -284,7 +285,7 @@ def cmd_services(host, auth, verbose=False, prefer_smb=False):
         return
     extra = [host, '-ConsoleOutputStyle', 'Csv']
     if prefer_smb:
-        extra += ['-PreferSmb', '-UseTcp4Only']
+        extra.append('-PreferSmb')
     out, rc = run(SCM, 'query', auth, extra, verbose=verbose, timeout=30)
     if rc != 0:
         print(f'[!] services failed\n{out}')
