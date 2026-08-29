@@ -42,7 +42,23 @@ else
     sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
            -e 's/^set -u$/set +u/' \
            "${TMP_DOTNET_INSTALL}"
-    bash "${TMP_DOTNET_INSTALL}" --runtime dotnet --version 8.0.0
+    # dotnet-install.sh uses $() subshells to parse curl progress/filenames.
+    # If run inside proxychains, "[proxychains] DLL init" messages go to stderr
+    # and get captured into those subshells, corrupting the download URL.
+    # Strip LD_PRELOAD so the script runs clean; extract the SOCKS5 proxy from
+    # the proxychains conf and pass it via curl's native HTTPS_PROXY so
+    # downloads still route through the proxy if needed.
+    _DOTNET_PROXY=""
+    for _pc in "${PROXYCHAINS_CONF_FILE:-}" "/etc/proxychains4.conf" \
+               "${HOME}/.proxychains/proxychains.conf" "/etc/proxychains.conf"; do
+        [[ -z "${_pc}" || ! -f "${_pc}" ]] && continue
+        _DOTNET_PROXY="$(awk '/^socks5/{print "socks5h://"$2":"$3; exit}' "${_pc}")"
+        break
+    done
+    env -u LD_PRELOAD \
+        ${_DOTNET_PROXY:+HTTPS_PROXY="${_DOTNET_PROXY}"} \
+        ${_DOTNET_PROXY:+HTTP_PROXY="${_DOTNET_PROXY}"} \
+        bash "${TMP_DOTNET_INSTALL}" --runtime dotnet --version 8.0.0
     rm -f "${TMP_DOTNET_INSTALL}"
     DOTNET_ROOT_FOUND="${HOME}/.dotnet"
     echo "[+] .NET 8 installed: ${DOTNET_ROOT_FOUND}"
