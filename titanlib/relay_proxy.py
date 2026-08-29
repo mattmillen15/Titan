@@ -313,20 +313,55 @@ def _safe_unlink(path: str):
         pass
 
 
+def _find_proxychains4_lib() -> str:
+    """Return path to libproxychains.so.4 (proxychains-ng), or '' if not found."""
+    archs = ['x86_64-linux-gnu', 'aarch64-linux-gnu', 'arm-linux-gnueabihf']
+    candidates = (
+        [f'/usr/lib/{a}/libproxychains.so.4' for a in archs]
+        + ['/usr/lib/libproxychains.so.4', '/usr/local/lib/libproxychains.so.4']
+    )
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return ''
+
+
 def activate_relay_mode() -> dict:
     """
     Called by dump.py / shell.py when --no-pass is active.
 
     Titanis subprocesses inherit LD_PRELOAD from the parent proxychains
-    invocation and pick up the system proxychains.conf automatically, so
-    they route through ntlmrelayx --socks without any extra configuration.
-    No relay-proxy subprocess or conf patching needed.
+    invocation and pick up the system proxychains.conf automatically.
+    If proxychains 3.x is detected, we substitute libproxychains.so.4 for
+    Titanis subprocesses — proxychains 3.x does not hook .NET socket calls.
     """
     ld_preload = os.environ.get('LD_PRELOAD', '')
-    if 'proxychains' in ld_preload.lower():
-        print('[*] relay mode: proxychains detected — '
-              'Titanis will route through ntlmrelayx SOCKS automatically',
+    if 'proxychains' not in ld_preload.lower():
+        return {}
+
+    # proxychains-ng 4.x (libproxychains.so.4) hooks .NET CoreCLR socket calls.
+    # proxychains 3.x does not — the Titanis .NET binary bypasses its hook and
+    # connects directly, so ntlmrelayx sees nothing.
+    if 'proxychains.so.4' not in ld_preload.lower():
+        pc4 = _find_proxychains4_lib()
+        if pc4:
+            conf = _find_proxychains_conf()
+            extra: dict = {'LD_PRELOAD': pc4}
+            if conf:
+                extra['PROXYCHAINS_CONF_FILE'] = conf
+            print(f'[*] relay mode: proxychains 3.x detected; '
+                  f'using proxychains-ng 4 for Titanis subprocesses',
+                  file=sys.stderr)
+            return extra
+        print('[!] relay mode: proxychains 3.x detected but libproxychains.so.4 not found\n'
+              '[!] Titanis .NET binaries will NOT route through ntlmrelayx\n'
+              '[!] Fix: install proxychains4 (apt install proxychains4) and run with proxychains4',
               file=sys.stderr)
+        return {}
+
+    print('[*] relay mode: proxychains detected — '
+          'Titanis will route through ntlmrelayx SOCKS automatically',
+          file=sys.stderr)
     return {}
 
 
