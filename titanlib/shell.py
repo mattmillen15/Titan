@@ -152,11 +152,6 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
         f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"'
     )
 
-    if smb_host == host:
-        print(f'[!] --scm: could not resolve {host!r} to an IPv4 address; '
-              'Titanis DNS may fail — pass an IP directly if this errors',
-              file=sys.stderr)
-
     if verbose:
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
         print(f'  [scm] bin={bin_path}',                 file=sys.stderr)
@@ -353,13 +348,23 @@ def _prompt(cwd, host):
 # ── Main shell loop ───────────────────────────────────────────────────────────
 
 def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
-          use_scm=False):
+          use_scm=False, conn_host=None):
+    # conn_host: IPv4 address (or resolvable name) for Titanis binary calls.
+    # host: display name shown in the prompt (may be FQDN from reverse DNS).
+    # When the user passes an IP in the target string, resolve_host() converts
+    # it to the FQDN for display; we preserve the original IP here so binaries
+    # don't have to forward-resolve a FQDN that may have AAAA-only DNS records.
+    if not conn_host:
+        conn_host = host
+
     print(BANNER_SCM if use_scm else BANNER)
     user = auth[auth.index('-UserName') + 1] if '-UserName' in auth else '?'
     mode = 'SCM+SMB (port 445 only)' if use_scm else 'WMI+SMB'
     print(f'[*] Connected to {host} as {user}')
     print(f'[*] Mode: {mode}')
     print(f'[*] Working directory: {cwd}')
+    if conn_host != host:
+        print(f'[*] Connection target: {conn_host}')
     print(f'[*] Type !help for built-in commands\n')
 
     while True:
@@ -380,27 +385,27 @@ def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
             rest  = parts[1] if len(parts) > 1 else ''
 
             if   cmd == 'help':     print(HELP)
-            elif cmd == 'upload':   cmd_upload(host, auth, rest, cwd, verbose=verbose)
-            elif cmd == 'download': cmd_download(host, auth, rest, verbose=verbose)
-            elif cmd == 'ls':       cmd_ls(host, auth, rest, cwd, verbose=verbose)
+            elif cmd == 'upload':   cmd_upload(conn_host, auth, rest, cwd, verbose=verbose)
+            elif cmd == 'download': cmd_download(conn_host, auth, rest, verbose=verbose)
+            elif cmd == 'ls':       cmd_ls(conn_host, auth, rest, cwd, verbose=verbose)
             elif cmd == 'cd':       cwd = cmd_cd(cwd, rest)
             elif cmd == 'pwd':      print(cwd)
             elif cmd == 'ps':
                 if use_scm:
                     print('[!] !ps requires WMI (DCOM/port 135) — not available in --scm relay mode')
                 else:
-                    cmd_ps(host, auth, verbose=verbose)
+                    cmd_ps(conn_host, auth, verbose=verbose)
             elif cmd == 'services':
-                cmd_services(host, auth, verbose=verbose, prefer_smb=use_scm)
-            elif cmd == 'shares':   cmd_shares(host, auth, verbose=verbose)
+                cmd_services(conn_host, auth, verbose=verbose, prefer_smb=use_scm)
+            elif cmd == 'shares':   cmd_shares(conn_host, auth, verbose=verbose)
             else: print(f'[!] unknown built-in: !{cmd}  (try !help)')
             continue
 
         if use_scm:
-            out, rc = _scm_exec(host, auth, line, cwd,
+            out, rc = _scm_exec(conn_host, auth, line, cwd,
                                  timeout=timeout, verbose=verbose)
         else:
-            out, rc = run(WMI, 'exec', auth, [host, f'cd /d {cwd} && {line}'],
+            out, rc = run(WMI, 'exec', auth, [conn_host, f'cd /d {cwd} && {line}'],
                           verbose=verbose, timeout=timeout)
 
         if out:
@@ -463,9 +468,13 @@ def main():
         from titanlib import common, relay_proxy
         common._relay_extra_env.update(relay_proxy.activate_relay_mode())
 
+    # target_raw: the host string exactly as the user typed it (IP preserved).
+    # resolve_host() may have converted it to an FQDN that only has AAAA records.
+    conn_host = getattr(args, 'target_raw', None) or args.target
+
     shell(args.target, auth_args(args),
           cwd=args.cwd, verbose=args.verbose, timeout=args.timeout,
-          use_scm=args.scm)
+          use_scm=args.scm, conn_host=conn_host)
 
 
 if __name__ == '__main__':

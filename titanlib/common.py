@@ -234,6 +234,11 @@ def apply_target_string(args, host_attr: str = 'target'):
                     and not getattr(args, 'ntlm_hash', None):
                 args.password = pw
             if host and not getattr(args, host_attr, None):
+                # Save raw host (IP or hostname as typed) before resolve_host
+                # converts an IP to its reverse-DNS FQDN.  Titanis binaries need
+                # an IPv4 address or a name that resolves to one; the FQDN can
+                # silently get AAAA-only DNS answers and fail to connect.
+                setattr(args, host_attr + '_raw', host)
                 setattr(args, host_attr, resolve_host(host))
             return
     # No @ — if the string looks like credentials (has / or :) treat it as
@@ -252,6 +257,7 @@ def apply_target_string(args, host_attr: str = 'target'):
                 args.password = pw
             return
     if not getattr(args, host_attr, None):
+        setattr(args, host_attr + '_raw', ts)
         setattr(args, host_attr, resolve_host(ts))
 
 
