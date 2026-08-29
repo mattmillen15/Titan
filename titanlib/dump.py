@@ -54,6 +54,26 @@ from cryptography.hazmat.backends import default_backend
 
 from titanlib.common import find_binary, make_env, run as _common_run
 
+
+def _md4(data: bytes) -> str:
+    """MD4 hex digest — falls back through multiple providers on OpenSSL 3.x."""
+    try:
+        return hashlib.new('md4', data).hexdigest()
+    except ValueError:
+        pass
+    try:
+        from impacket.crypto import MD4
+        return MD4.new(data).hexdigest()
+    except Exception:
+        pass
+    try:
+        from Cryptodome.Hash import MD4
+        return MD4.new(data).hexdigest()
+    except Exception:
+        pass
+    from Crypto.Hash import MD4
+    return MD4.new(data).hexdigest()
+
 try:
     from impacket.dpapi import MasterKeyFile as _MKFile, MasterKey as _MK, DPAPI_BLOB as _DBlob
     _HAS_IMPACKET_DPAPI = True
@@ -552,11 +572,11 @@ def _dump_lsa(hostname, raw_csv, auth, out, verbose=False):
 
         elif name == '$MACHINE.ACC':
             if cur:
-                nt = hashlib.new('md4', bytes.fromhex(cur)).hexdigest()
+                nt = _md4(bytes.fromhex(cur))
                 lsa_lines.append('$MACHINE.ACC')
                 lsa_lines.append(f'  {nt}')
             if old and old != cur:
-                lsa_lines.append(f'  (old) {hashlib.new("md4", bytes.fromhex(old)).hexdigest()}')
+                lsa_lines.append(f'  (old) {_md4(bytes.fromhex(old))}')
 
         elif name.startswith('_SC_'):
             if not cur:

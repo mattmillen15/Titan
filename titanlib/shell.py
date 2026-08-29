@@ -81,6 +81,20 @@ All other input is sent to cmd.exe on the remote host.
 Paths accept both \\ and / separators."""
 
 
+def _resolve_ip(host: str) -> str:
+    """Resolve hostname to IP via system resolver (UDP, not intercepted by proxychains)."""
+    import socket as _sock
+    try:
+        _sock.inet_aton(host)
+        return host  # already an IP
+    except OSError:
+        pass
+    try:
+        return _sock.gethostbyname(host)
+    except OSError:
+        return host
+
+
 def _unc(host, win_path):
     p = win_path.replace('/', '\\')
     if len(p) >= 2 and p[1] == ':':
@@ -112,7 +126,10 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     svc_name  = 'ts' + _rand(6)
     out_fname = _rand(10) + '.txt'
     out_win   = f'C:\\Windows\\Temp\\{out_fname}'
-    out_unc   = f'\\\\{host}\\ADMIN$\\Temp\\{out_fname}'
+    # Use resolved IP in UNC path — IP-based paths skip DFS referral lookups,
+    # which would otherwise try port 389 (LDAP) that ntlmrelayx can't relay.
+    smb_host  = _resolve_ip(host)
+    out_unc   = f'\\\\{smb_host}\\ADMIN$\\Temp\\{out_fname}'
 
     # cmd.exe runs the command, redirects stdout+stderr to a temp file.
     # Quoting: the outer quotes are for cmd /c; the inner command is raw.
