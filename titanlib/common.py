@@ -50,12 +50,23 @@ def find_binary(name: str):
 _relay_extra_env: dict = {}
 
 
+def _has_dotnet8(root: str) -> bool:
+    try:
+        d = os.path.join(root, 'shared', 'Microsoft.NETCore.App')
+        return any(v.startswith('8.') for v in os.listdir(d))
+    except OSError:
+        return False
+
+
 def make_env() -> dict:
-    """Build an environment dict with DOTNET_ROOT set correctly."""
+    """Build an environment dict with DOTNET_ROOT set to a .NET 8 installation."""
     env = os.environ.copy()
     dotnet_root = env.get('DOTNET_ROOT', '')
 
-    if not dotnet_root or not os.path.isdir(os.path.join(dotnet_root, 'shared')):
+    # Re-search if DOTNET_ROOT is missing, invalid, or doesn't have .NET 8.
+    # This self-heals wrappers written by an older install.sh that picked a
+    # .NET 6 installation (e.g. /usr/share/dotnet) when .NET 8 wasn't yet present.
+    if not dotnet_root or not _has_dotnet8(dotnet_root):
         candidates = [
             os.path.expanduser('~/.dotnet'),
             '/usr/share/dotnet',
@@ -70,10 +81,17 @@ def make_env() -> dict:
             except Exception:
                 pass
 
+        # Prefer a root that has .NET 8
         for path in candidates:
-            if path and os.path.isdir(os.path.join(path, 'shared')):
+            if path and _has_dotnet8(path):
                 dotnet_root = path
                 break
+        else:
+            # Fall back to any root with a shared/ dir
+            for path in candidates:
+                if path and os.path.isdir(os.path.join(path, 'shared')):
+                    dotnet_root = path
+                    break
 
     if dotnet_root:
         env['DOTNET_ROOT'] = dotnet_root

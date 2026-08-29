@@ -20,15 +20,12 @@ find_dotnet() {
             echo "${d}"; return 0
         fi
     done
-    # Accept any runtime version if .NET 8 not found
-    for d in "${DOTNET_ROOT:-}" "${HOME}/.dotnet" "/usr/share/dotnet" "/usr/local/share/dotnet"; do
-        [[ -z "${d}" ]] && continue
-        [[ -d "${d}/shared" ]] && { echo "${d}"; return 0; }
-    done
     # Check /etc/dotnet/install_location
     if [[ -f /etc/dotnet/install_location ]]; then
         loc="$(cat /etc/dotnet/install_location)"
-        [[ -d "${loc}/shared" ]] && { echo "${loc}"; return 0; }
+        if ls "${loc}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^8\."; then
+            echo "${loc}"; return 0
+        fi
     fi
     return 1
 }
