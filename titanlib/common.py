@@ -44,6 +44,12 @@ def find_binary(name: str):
 
 # ── .NET runtime environment ──────────────────────────────────────────────────
 
+# Extra env vars injected into every Titanis subprocess.
+# relay_proxy.activate_relay_mode() populates this with PROXYCHAINS_CONF_FILE
+# so Titanis picks up the patched proxychains conf automatically.
+_relay_extra_env: dict = {}
+
+
 def make_env() -> dict:
     """Build an environment dict with DOTNET_ROOT set correctly."""
     env = os.environ.copy()
@@ -73,6 +79,8 @@ def make_env() -> dict:
         env['DOTNET_ROOT'] = dotnet_root
         if dotnet_root not in env.get('PATH', ''):
             env['PATH'] = dotnet_root + os.pathsep + env.get('PATH', '')
+    if _relay_extra_env:
+        env.update(_relay_extra_env)
     return env
 
 

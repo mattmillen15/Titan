@@ -134,9 +134,7 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     while time.time() < deadline:
         time.sleep(0.5)
         out, _ = run(SCM, 'query', auth,
-                     [host, '-ConsoleOutputStyle', 'Csv',
-                      '-OutputFields', 'ServiceName,State,Win32ExitCode',
-                      '-PreferSmb'],
+                     [host, '-ConsoleOutputStyle', 'Csv', '-PreferSmb'],
                      verbose=False, timeout=15)
         for row in _parse_csv(out):
             if row.get('ServiceName', '').lower() == svc_name.lower():
@@ -429,6 +427,10 @@ def main():
         sys.exit(1)
     if not args.scm and not SCM:
         print('[!] Scm binary not found — !services will be unavailable', file=sys.stderr)
+
+    if getattr(args, 'no_pass', False):
+        from titanlib import common, relay_proxy
+        common._relay_extra_env.update(relay_proxy.activate_relay_mode())
 
     shell(args.target, auth_args(args),
           cwd=args.cwd, verbose=args.verbose, timeout=args.timeout,

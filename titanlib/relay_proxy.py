@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """
-titan relay-proxy — SMB2 credit-booster for ntlmrelayx --socks
+SMB2 credit-booster proxy for ntlmrelayx --socks.
 
 ntlmrelayx forges NEGOTIATE/SESSION_SETUP responses with CreditRequestResponse=1
-and MaxTransactSize=65536. Any SMB2 request requiring more than one credit (payload
-> 65536 bytes) fails before it can reach the real server.
+and MaxTransactSize=65536, which causes "packet too large" errors when Titanis
+tries to send DCE/RPC payloads larger than 65536 bytes.
 
-This proxy sits between proxychains/:1080 (ntlmrelayx SOCKS) and Titanis:
+This module provides two interfaces:
 
-    Titanis  ──►  relay-proxy:1082  ──►  ntlmrelayx:1080  ──►  target:445
+  activate_relay_mode()
+      Called automatically by titan dump/shell when --no-pass is detected.
+      Detects proxychains, starts a credit-booster proxy thread, writes a
+      patched proxychains.conf, and returns an env dict so Titanis subprocesses
+      pick up the patched conf. Zero user action required.
 
-It patches forged SMB2 NEGOTIATE and SESSION_SETUP responses in-flight:
-  - CreditRequestResponse  1  → 64
-  - MaxTransactSize  65536  → 8388608   (NEGOTIATE body only)
-  - MaxReadSize      65536  → 8388608
-  - MaxWriteSize     65536  → 8388608
-
-Requires no ntlmrelayx restart. Point proxychains at the proxy port instead
-of the ntlmrelayx SOCKS port.
+  run_proxy() / main()
+      Manual mode (titan relay-proxy CLI) for debugging.
 """
 
 import argparse
+import atexit
+import os
+import re
 import socket
 import struct
-import threading
 import sys
+import tempfile
+import threading
+import time
 
 # ── SMB2 constants ──────────────────────────────────────────────────────────
 
@@ -217,17 +220,19 @@ def _handle_client(client_sock: socket.socket,
 
 
 def run_proxy(listen_host: str = '127.0.0.1', listen_port: int = 1082,
-              relay_host: str = '127.0.0.1', relay_port: int = 1080):
+              relay_host: str = '127.0.0.1', relay_port: int = 1080,
+              quiet: bool = False):
     """Start the credit-booster proxy (blocks until KeyboardInterrupt)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((listen_host, listen_port))
     srv.listen(32)
-    print(f'[*] relay-proxy listening on {listen_host}:{listen_port}')
-    print(f'[*] forwarding → ntlmrelayx SOCKS {relay_host}:{relay_port}')
-    print(f'[*] patching NEGOTIATE/SESSION_SETUP: credits 1→{_CREDIT_BOOST}, '
-          f'MaxTransact/Read/WriteSize 65536→{_MAX_SIZE_BOOST}')
-    print(f'[*] set proxychains socks5 {listen_host} {listen_port}')
+    if not quiet:
+        print(f'[*] relay-proxy listening on {listen_host}:{listen_port}')
+        print(f'[*] forwarding → ntlmrelayx SOCKS {relay_host}:{relay_port}')
+        print(f'[*] patching NEGOTIATE/SESSION_SETUP: credits 1→{_CREDIT_BOOST}, '
+              f'MaxTransact/Read/WriteSize 65536→{_MAX_SIZE_BOOST}')
+        print(f'[*] point proxychains at socks5 {listen_host} {listen_port}')
     try:
         while True:
             conn, addr = srv.accept()
@@ -237,10 +242,134 @@ def run_proxy(listen_host: str = '127.0.0.1', listen_port: int = 1082,
                 daemon=True)
             t.start()
     except KeyboardInterrupt:
-        print('\n[*] relay-proxy stopped')
+        if not quiet:
+            print('\n[*] relay-proxy stopped')
     finally:
         srv.close()
 
+
+# ── Automatic relay-mode activation (called by dump.py / shell.py) ────────────
+
+_relay_activated = False
+_relay_conf_path: str = ''
+
+
+def _find_proxychains_conf() -> str:
+    env_conf = os.environ.get('PROXYCHAINS_CONF_FILE', '')
+    if env_conf and os.path.isfile(env_conf):
+        return env_conf
+    for p in [os.path.expanduser('~/.proxychains/proxychains.conf'),
+              '/etc/proxychains4.conf', '/etc/proxychains.conf']:
+        if os.path.isfile(p):
+            return p
+    return ''
+
+
+def _parse_socks5_upstream(conf_path: str) -> tuple[str, int]:
+    """Return (host, port) of the first socks5 line in the conf."""
+    with open(conf_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('#'):
+                continue
+            m = re.match(r'socks5\s+(\S+)\s+(\d+)', line, re.IGNORECASE)
+            if m:
+                return m.group(1), int(m.group(2))
+    return '127.0.0.1', 1080
+
+
+def _pick_free_port(start: int = 1082) -> int:
+    for port in range(start, start + 20):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('127.0.0.1', port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    raise OSError('no free port found in range %d-%d' % (start, start + 19))
+
+
+def _write_patched_conf(orig_conf: str, listen_port: int) -> str:
+    """Copy proxychains conf, replacing the socks5 port with listen_port."""
+    with open(orig_conf) as f:
+        content = f.read()
+    content = re.sub(
+        r'(socks5\s+\S+\s+)\d+',
+        lambda m: m.group(1) + str(listen_port),
+        content,
+        flags=re.IGNORECASE,
+    )
+    fd, path = tempfile.mkstemp(prefix='titan_relay_', suffix='.conf')
+    with os.fdopen(fd, 'w') as f:
+        f.write(content)
+    atexit.register(_safe_unlink, path)
+    return path
+
+
+def _safe_unlink(path: str):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def activate_relay_mode() -> dict:
+    """
+    Detect proxychains, start credit-booster proxy thread, return env dict.
+
+    Returns {'PROXYCHAINS_CONF_FILE': '<patched_conf>'} so Titanis subprocesses
+    route through the proxy. Returns {} if proxychains is not detected.
+    Called once by dump.py and shell.py when --no-pass is active.
+    """
+    global _relay_activated, _relay_conf_path
+
+    if _relay_activated:
+        return {'PROXYCHAINS_CONF_FILE': _relay_conf_path} if _relay_conf_path else {}
+
+    _relay_activated = True  # mark early to prevent double-init on concurrent calls
+
+    ld_preload = os.environ.get('LD_PRELOAD', '')
+    if 'proxychains' not in ld_preload.lower():
+        return {}
+
+    conf = _find_proxychains_conf()
+    if not conf:
+        print('[!] relay-proxy: proxychains detected but conf not found; '
+              'credit fix inactive', file=sys.stderr)
+        return {}
+
+    relay_host, relay_port = _parse_socks5_upstream(conf)
+
+    try:
+        listen_port = _pick_free_port(1082)
+    except OSError as e:
+        print(f'[!] relay-proxy: {e}; credit fix inactive', file=sys.stderr)
+        return {}
+
+    t = threading.Thread(
+        target=run_proxy,
+        kwargs=dict(listen_host='127.0.0.1', listen_port=listen_port,
+                    relay_host=relay_host, relay_port=relay_port,
+                    quiet=True),
+        daemon=True,
+    )
+    t.start()
+    time.sleep(0.15)  # wait for socket to bind
+
+    try:
+        _relay_conf_path = _write_patched_conf(conf, listen_port)
+    except Exception as e:
+        print(f'[!] relay-proxy: could not write patched conf: {e}; '
+              'credit fix inactive', file=sys.stderr)
+        return {}
+
+    print(f'[*] relay-proxy: :{listen_port} → ntlmrelayx :{relay_port} '
+          f'(SMB2 credits patched)', file=sys.stderr)
+    return {'PROXYCHAINS_CONF_FILE': _relay_conf_path}
+
+
+# ── Manual CLI (titan relay-proxy) ────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
