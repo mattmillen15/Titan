@@ -52,7 +52,7 @@ else
     for _pc in "${PROXYCHAINS_CONF_FILE:-}" "/etc/proxychains4.conf" \
                "${HOME}/.proxychains/proxychains.conf" "/etc/proxychains.conf"; do
         [[ -z "${_pc}" || ! -f "${_pc}" ]] && continue
-        _DOTNET_PROXY="$(awk '/^socks[45]/{scheme=($1=="socks5"?"socks5h":"socks4a"); print scheme"://"$2":"$3; exit}' "${_pc}")"
+        _DOTNET_PROXY="$(awk '/^socks[45]/{scheme=($1=="socks5"?"socks5h":($1=="socks4a"?"socks4a":"socks4")); print scheme"://"$2":"$3; exit}' "${_pc}")"
         break
     done
     env -u LD_PRELOAD \
