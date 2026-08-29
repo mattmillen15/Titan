@@ -350,15 +350,40 @@ def activate_relay_mode() -> dict:
         print(f'[!] relay-proxy: {e}; credit fix inactive', file=sys.stderr)
         return {}
 
-    t = threading.Thread(
-        target=run_proxy,
-        kwargs=dict(listen_host='127.0.0.1', listen_port=listen_port,
-                    relay_host=relay_host, relay_port=relay_port,
-                    quiet=True),
-        daemon=True,
+    # Run the relay-proxy as a subprocess with LD_PRELOAD cleared.
+    # A thread inside this (proxychains-wrapped) Python process would have its
+    # socket.create_connection() calls intercepted by the proxychains LD_PRELOAD
+    # hook, which routes 127.0.0.1:relay_port back through ntlmrelayx and
+    # creates a recursive loop.  A subprocess with LD_PRELOAD='' connects to
+    # ntlmrelayx directly, bypassing the hook entirely.
+    import subprocess as _sp
+    _relay_env = dict(os.environ)
+    _relay_env['LD_PRELOAD'] = ''
+
+    _proc = _sp.Popen(
+        [sys.executable, os.path.abspath(__file__),
+         '--listen-host', '127.0.0.1',
+         '--listen-port', str(listen_port),
+         '--relay-host', relay_host,
+         '--relay-port', str(relay_port)],
+        env=_relay_env,
+        stdout=_sp.DEVNULL,
+        stderr=_sp.DEVNULL,
     )
-    t.start()
-    time.sleep(0.15)  # wait for socket to bind
+
+    def _cleanup(p):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup, _proc)
+    time.sleep(0.25)  # wait for socket to bind
+
+    if _proc.poll() is not None:
+        print(f'[!] relay-proxy: subprocess exited (rc={_proc.poll()}); '
+              'credit fix inactive', file=sys.stderr)
+        return {}
 
     try:
         _relay_conf_path = _write_patched_conf(conf, listen_port)
