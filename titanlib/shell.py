@@ -152,20 +152,31 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
         f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"'
     )
 
+    if smb_host == host:
+        print(f'[!] --scm: could not resolve {host!r} to an IPv4 address; '
+              'Titanis DNS may fail — pass an IP directly if this errors',
+              file=sys.stderr)
+
     if verbose:
         print(f'  [scm] svc={svc_name}  out={out_win}', file=sys.stderr)
         print(f'  [scm] bin={bin_path}',                 file=sys.stderr)
 
-    # Create via TCP (port 135) — -PreferSmb on create is a known Titanis bug.
-    _, rc = run(SCM, 'create', auth, [host, svc_name, bin_path],
+    # Create: try named pipe (port 445, relay-compatible) first; some targets
+    # return ERROR_INVALID_PARAMETER for CreateService over named pipe — fall
+    # back to TCP (port 135) in that case.  Always use the resolved IP so
+    # Titanis' .NET resolver doesn't get only IPv6 AAAA records.
+    _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path, '-PreferSmb'],
                 verbose=verbose, timeout=30)
+    if rc != 0:
+        _, rc = run(SCM, 'create', auth, [smb_host, svc_name, bin_path],
+                    verbose=verbose, timeout=30)
     if rc != 0:
         return f'[!] Scm create failed (rc={rc})\n', rc
 
     # Start via named pipe (port 445).  cmd.exe exits without calling
     # SetServiceStatus, so SCM raises ERROR_SERVICE_REQUEST_TIMEOUT — that is
     # the expected "success" signal meaning the command ran.
-    _, _ = run(SCM, 'start', auth, [host, svc_name, '-PreferSmb'],
+    _, _ = run(SCM, 'start', auth, [smb_host, svc_name, '-PreferSmb'],
                verbose=verbose, timeout=max(timeout, 40))
 
     # Brief sleep so cmd.exe flushes the output file before we read it.
@@ -186,7 +197,7 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
             except OSError:
                 pass
 
-    run(SCM, 'delete', auth, [host, svc_name, '-PreferSmb'],
+    run(SCM, 'delete', auth, [smb_host, svc_name, '-PreferSmb'],
         verbose=verbose, timeout=15)
 
     return result, 0
