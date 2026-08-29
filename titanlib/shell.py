@@ -493,13 +493,13 @@ def main():
     if not args.scm and not SCM:
         print('[!] Scm binary not found — !services will be unavailable', file=sys.stderr)
 
-    if getattr(args, 'no_pass', False):
-        from titanlib import common, relay_proxy
-        common._relay_extra_env.update(relay_proxy.activate_relay_mode())
-
     # target_raw: the host string exactly as the user typed it (IP preserved).
     # resolve_host() may have converted it to an FQDN that only has AAAA records.
     conn_host = getattr(args, 'target_raw', None) or args.target
+
+    if getattr(args, 'no_pass', False):
+        from titanlib import common, relay_proxy
+        common._relay_extra_env.update(relay_proxy.activate_relay_mode(target_ip=conn_host))
 
     shell(args.target, auth_args(args),
           cwd=args.cwd, verbose=args.verbose, timeout=args.timeout,
