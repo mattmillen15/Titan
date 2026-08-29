@@ -315,86 +315,19 @@ def _safe_unlink(path: str):
 
 def activate_relay_mode() -> dict:
     """
-    Detect proxychains, start credit-booster proxy thread, return env dict.
+    Called by dump.py / shell.py when --no-pass is active.
 
-    Returns {'PROXYCHAINS_CONF_FILE': '<patched_conf>'} so Titanis subprocesses
-    route through the proxy. Returns {} if proxychains is not detected.
-    Called once by dump.py and shell.py when --no-pass is active.
+    Titanis subprocesses inherit LD_PRELOAD from the parent proxychains
+    invocation and pick up the system proxychains.conf automatically, so
+    they route through ntlmrelayx --socks without any extra configuration.
+    No relay-proxy subprocess or conf patching needed.
     """
-    global _relay_activated, _relay_conf_path
-
-    if _relay_activated:
-        return {'PROXYCHAINS_CONF_FILE': _relay_conf_path} if _relay_conf_path else {}
-
-    _relay_activated = True  # mark early to prevent double-init on concurrent calls
-
     ld_preload = os.environ.get('LD_PRELOAD', '')
-    if 'proxychains' not in ld_preload.lower():
-        return {}
-
-    conf = _find_proxychains_conf()
-    if not conf:
-        print('[!] relay-proxy: proxychains detected but conf not found; '
-              'credit fix inactive', file=sys.stderr)
-        return {}
-
-    # Always target ntlmrelayx at its default SOCKS port (1080), regardless of
-    # what the proxychains conf says. The conf may have been previously changed
-    # to point at our own relay-proxy port — reading it would cause a loop.
-    relay_host = '127.0.0.1'
-    relay_port = int(os.environ.get('NTLMRELAYX_SOCKS_PORT', '1080'))
-
-    try:
-        listen_port = _pick_free_port(1082)
-    except OSError as e:
-        print(f'[!] relay-proxy: {e}; credit fix inactive', file=sys.stderr)
-        return {}
-
-    # Run the relay-proxy as a subprocess with LD_PRELOAD cleared.
-    # A thread inside this (proxychains-wrapped) Python process would have its
-    # socket.create_connection() calls intercepted by the proxychains LD_PRELOAD
-    # hook, which routes 127.0.0.1:relay_port back through ntlmrelayx and
-    # creates a recursive loop.  A subprocess with LD_PRELOAD='' connects to
-    # ntlmrelayx directly, bypassing the hook entirely.
-    import subprocess as _sp
-    _relay_env = dict(os.environ)
-    _relay_env['LD_PRELOAD'] = ''
-
-    _proc = _sp.Popen(
-        [sys.executable, os.path.abspath(__file__),
-         '--listen-host', '127.0.0.1',
-         '--listen-port', str(listen_port),
-         '--relay-host', relay_host,
-         '--relay-port', str(relay_port)],
-        env=_relay_env,
-        stdout=_sp.DEVNULL,
-        stderr=_sp.DEVNULL,
-    )
-
-    def _cleanup(p):
-        try:
-            p.terminate()
-        except Exception:
-            pass
-
-    atexit.register(_cleanup, _proc)
-    time.sleep(0.25)  # wait for socket to bind
-
-    if _proc.poll() is not None:
-        print(f'[!] relay-proxy: subprocess exited (rc={_proc.poll()}); '
-              'credit fix inactive', file=sys.stderr)
-        return {}
-
-    try:
-        _relay_conf_path = _write_patched_conf(conf, listen_port)
-    except Exception as e:
-        print(f'[!] relay-proxy: could not write patched conf: {e}; '
-              'credit fix inactive', file=sys.stderr)
-        return {}
-
-    print(f'[*] relay-proxy: :{listen_port} → ntlmrelayx :{relay_port} '
-          f'(SMB2 credits patched)', file=sys.stderr)
-    return {'PROXYCHAINS_CONF_FILE': _relay_conf_path}
+    if 'proxychains' in ld_preload.lower():
+        print('[*] relay mode: proxychains detected — '
+              'Titanis will route through ntlmrelayx SOCKS automatically',
+              file=sys.stderr)
+    return {}
 
 
 # ── Manual CLI (titan relay-proxy) ────────────────────────────────────────────
