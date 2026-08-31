@@ -2170,10 +2170,6 @@ def main():
     args  = parse_args()
     auth  = _auth_args(args)
 
-    if args.no_pass:
-        from titanlib import common, relay_proxy
-        common._relay_extra_env.update(relay_proxy.activate_relay_mode())
-
     raw   = ([args.target] if args.target else [h.strip() for h in args.file])
     hosts = _expand_hosts(raw)
 
