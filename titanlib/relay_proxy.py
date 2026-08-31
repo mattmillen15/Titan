@@ -20,12 +20,10 @@ This module provides two interfaces:
 
 import argparse
 import atexit
-import glob
 import os
 import re
 import socket
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
@@ -167,25 +165,6 @@ def _relay_direction(src: socket.socket, dst: socket.socket,
         except Exception: pass
 
 
-def _handle_client_transparent(client_sock: socket.socket,
-                               relay_host: str, relay_port: int,
-                               target_host: str, target_port: int):
-    """Handle a raw TCP connection (no SOCKS5 handshake) by tunneling to target."""
-    try:
-        relay_sock = _socks5_connect(relay_host, relay_port, target_host, target_port)
-        t1 = threading.Thread(target=_relay_direction,
-                              args=(relay_sock, client_sock, True, 'srv→cli'), daemon=True)
-        t2 = threading.Thread(target=_relay_direction,
-                              args=(client_sock, relay_sock, False, 'cli→srv'), daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-    except Exception as e:
-        print(f'  [!] relay_proxy transparent error: {e}', file=sys.stderr)
-    finally:
-        try: client_sock.close()
-        except Exception: pass
-
-
 def _handle_client(client_sock: socket.socket,
                    relay_host: str, relay_port: int,
                    dest_host: str, dest_port: int):
@@ -242,13 +221,8 @@ def _handle_client(client_sock: socket.socket,
 
 def run_proxy(listen_host: str = '127.0.0.1', listen_port: int = 1082,
               relay_host: str = '127.0.0.1', relay_port: int = 1080,
-              target_host: str = '', target_port: int = 445,
-              quiet: bool = False, transparent: bool = False):
-    """Start the credit-booster proxy (blocks until KeyboardInterrupt).
-
-    transparent=True: raw TCP in → SOCKS5 tunnel out (used with the C connect hook).
-    transparent=False: SOCKS5 server in → SOCKS5 tunnel out (manual relay-proxy mode).
-    """
+              quiet: bool = False):
+    """Start the credit-booster proxy (blocks until KeyboardInterrupt)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((listen_host, listen_port))
@@ -256,25 +230,16 @@ def run_proxy(listen_host: str = '127.0.0.1', listen_port: int = 1082,
     if not quiet:
         print(f'[*] relay-proxy listening on {listen_host}:{listen_port}')
         print(f'[*] forwarding → ntlmrelayx SOCKS {relay_host}:{relay_port}')
-        if transparent:
-            print(f'[*] transparent mode → {target_host}:{target_port}')
-        else:
-            print(f'[*] patching NEGOTIATE/SESSION_SETUP: credits 1→{_CREDIT_BOOST}, '
-                  f'MaxTransact/Read/WriteSize 65536→{_MAX_SIZE_BOOST}')
-            print(f'[*] point proxychains at socks5 {listen_host} {listen_port}')
+        print(f'[*] patching NEGOTIATE/SESSION_SETUP: credits 1→{_CREDIT_BOOST}, '
+              f'MaxTransact/Read/WriteSize 65536→{_MAX_SIZE_BOOST}')
+        print(f'[*] point proxychains at socks5 {listen_host} {listen_port}')
     try:
         while True:
             conn, addr = srv.accept()
-            if transparent:
-                t = threading.Thread(
-                    target=_handle_client_transparent,
-                    args=(conn, relay_host, relay_port, target_host, target_port),
-                    daemon=True)
-            else:
-                t = threading.Thread(
-                    target=_handle_client,
-                    args=(conn, relay_host, relay_port, '', 0),
-                    daemon=True)
+            t = threading.Thread(
+                target=_handle_client,
+                args=(conn, relay_host, relay_port, '', 0),
+                daemon=True)
             t.start()
     except KeyboardInterrupt:
         if not quiet:
@@ -350,18 +315,19 @@ def _safe_unlink(path: str):
 
 def _find_proxychains4_lib() -> str:
     """Return path to libproxychains.so.4 (proxychains-ng), or '' if not found."""
+    import glob as _glob
     archs = ['x86_64-linux-gnu', 'aarch64-linux-gnu', 'arm-linux-gnueabihf']
     candidates = (
         [f'/usr/lib/{a}/libproxychains.so.4' for a in archs]
         + ['/usr/lib/libproxychains.so.4', '/usr/local/lib/libproxychains.so.4',
-           '/tmp/libproxychains.so.4']           # manual-copy fallback
+           '/tmp/libproxychains.so.4']
     )
     for c in candidates:
         if os.path.isfile(c):
             return c
-    # ldconfig cache
     try:
-        out = subprocess.run(['ldconfig', '-p'], capture_output=True, text=True, timeout=5)
+        import subprocess as _sp
+        out = _sp.run(['ldconfig', '-p'], capture_output=True, text=True, timeout=5)
         for line in out.stdout.splitlines():
             if 'libproxychains.so.4' in line and '=>' in line:
                 path = line.split('=>', 1)[1].strip()
@@ -369,174 +335,48 @@ def _find_proxychains4_lib() -> str:
                     return path
     except Exception:
         pass
-    # glob fallback
     for pattern in ['/usr/lib/**/libproxychains.so.4',
                     '/usr/local/lib/**/libproxychains.so.4']:
-        for p in glob.glob(pattern, recursive=True):
+        for p in _glob.glob(pattern, recursive=True):
             if os.path.isfile(p):
                 return p
     return ''
 
 
-# ── Transparent relay: C hook + subprocess relay-proxy ───────────────────────
-
-_HOOK_C_SRC = """\
-#define _GNU_SOURCE
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <dlfcn.h>
-#include <string.h>
-#include <stdint.h>
-
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    typedef int (*real_fn)(int, const struct sockaddr *, socklen_t);
-    real_fn real = (real_fn)dlsym(RTLD_NEXT, "connect");
-    if (addr && addr->sa_family == AF_INET) {
-        const struct sockaddr_in *in4 = (const struct sockaddr_in *)addr;
-        if (__builtin_bswap16(in4->sin_port) == 445) {
-            struct sockaddr_in r;
-            memset(&r, 0, sizeof(r));
-            r.sin_family      = AF_INET;
-            r.sin_addr.s_addr = __builtin_bswap32(0x7f000001u);
-            r.sin_port        = __builtin_bswap16((uint16_t)RELAY_PORT);
-            return real(sockfd, (struct sockaddr *)&r, sizeof(r));
-        }
-    }
-    return real(sockfd, addr, addrlen);
-}
-"""
-
-
-def _compile_connect_hook(listen_port: int) -> str:
-    """Compile a connect() hook that redirects port 445 to the relay-proxy."""
-    hook_so = f'/tmp/titan_relay_hook_{listen_port}.so'
-    if os.path.isfile(hook_so):
-        return hook_so
-    fd, src = tempfile.mkstemp(suffix='.c', prefix='titan_hook_')
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(_HOOK_C_SRC)
-        result = subprocess.run(
-            ['gcc', '-shared', '-fPIC', '-O1', '-nostartfiles',
-             f'-DRELAY_PORT={listen_port}', '-o', hook_so, src, '-ldl'],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            print(f'[!] relay mode: hook compile failed:\n{result.stderr.strip()}',
-                  file=sys.stderr)
-            return ''
-        atexit.register(_safe_unlink, hook_so)
-        return hook_so
-    except FileNotFoundError:
-        print('[!] relay mode: gcc not found — cannot compile connect() hook\n'
-              '[!] Fix: apt install gcc  OR  apt install proxychains4',
-              file=sys.stderr)
-        return ''
-    except Exception as e:
-        print(f'[!] relay mode: hook compile error: {e}', file=sys.stderr)
-        return ''
-    finally:
-        _safe_unlink(src)
-
-
-def _start_transparent_relay(relay_host: str, relay_port: int,
-                              target_host: str, target_port: int = 445) -> int:
-    """Start a relay-proxy subprocess in transparent mode. Returns listen port or 0."""
-    try:
-        listen_port = _pick_free_port(1083)
-    except OSError as e:
-        print(f'[!] relay mode: {e}', file=sys.stderr)
-        return 0
-    env = dict(os.environ)
-    env['LD_PRELOAD'] = ''   # must NOT go through proxychains or our own hook
-    proc = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__),
-         '--listen-port', str(listen_port),
-         '--relay-host', relay_host,
-         '--relay-port', str(relay_port),
-         '--target-host', target_host,
-         '--target-port', str(target_port),
-         '--transparent', '--quiet'],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    atexit.register(lambda p: p.terminate(), proc)
-    # Poll for up to 2 s
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        time.sleep(0.1)
-        if proc.poll() is not None:
-            print('[!] relay mode: transparent relay-proxy exited early', file=sys.stderr)
-            return 0
-    return listen_port
-
-
-def activate_relay_mode(target_ip: str = '', target_port: int = 445) -> dict:
+def activate_relay_mode() -> dict:
     """
     Called by dump.py / shell.py when --no-pass is active.
 
-    Strategy (in order):
-      1. proxychains-ng 4.x in LD_PRELOAD: hooks .NET directly — nothing to do.
-      2. proxychains 3.x + libproxychains.so.4 available: substitute the 4.x lib.
-      3. Fallback: compile a tiny connect() hook + start a transparent relay-proxy
-         so Titanis' port-445 connects go through ntlmrelayx via our Python bridge.
+    Titanis subprocesses inherit LD_PRELOAD from the parent proxychains
+    invocation and pick up the system proxychains.conf automatically.
+    If proxychains 3.x is detected, substitute libproxychains.so.4 —
+    proxychains 3.x does not hook .NET CoreCLR socket calls.
     """
     ld_preload = os.environ.get('LD_PRELOAD', '')
     if 'proxychains' not in ld_preload.lower():
         return {}
 
-    # proxychains-ng 4.x hooks .NET CoreCLR socket calls correctly.
     if 'proxychains.so.4' in ld_preload.lower():
         print('[*] relay mode: proxychains-ng 4.x — routing through ntlmrelayx automatically',
               file=sys.stderr)
         return {}
 
-    # proxychains 3.x: try to substitute libproxychains.so.4
+    # proxychains 3.x: try to substitute proxychains-ng 4.x lib
     pc4 = _find_proxychains4_lib()
     if pc4:
         conf = _find_proxychains_conf()
         extra: dict = {'LD_PRELOAD': pc4}
         if conf:
             extra['PROXYCHAINS_CONF_FILE'] = conf
-        print(f'[*] relay mode: proxychains 3.x → using proxychains-ng 4 for Titanis',
+        print('[*] relay mode: proxychains 3.x → using proxychains-ng 4 for Titanis',
               file=sys.stderr)
         return extra
 
-    # Last resort: C hook + transparent relay-proxy subprocess.
-    # The hook library (LD_PRELOAD) intercepts Titanis' connect(target:445) and
-    # redirects it to our relay-proxy.  The relay-proxy connects to ntlmrelayx
-    # using the parent process's proxychains-hooked Python socket (which works
-    # because Python uses libc, unlike the .NET binary with proxychains 3.x).
-    if not target_ip:
-        print('[!] relay mode: proxychains 3.x; libproxychains.so.4 not found; '
-              'target IP unknown — cannot activate transparent relay\n'
-              '[!] Fix: apt install proxychains4', file=sys.stderr)
-        return {}
-
-    conf = _find_proxychains_conf()
-    relay_host, relay_port = '127.0.0.1', 1080
-    if conf:
-        try:
-            relay_host, relay_port = _parse_socks5_upstream(conf)
-        except Exception:
-            pass
-
-    listen_port = _start_transparent_relay(relay_host, relay_port, target_ip, target_port)
-    if not listen_port:
-        print('[!] relay mode: transparent relay-proxy failed to start — '
-              'Titanis will NOT route through ntlmrelayx\n'
-              '[!] Fix: apt install proxychains4', file=sys.stderr)
-        return {}
-
-    hook_so = _compile_connect_hook(listen_port)
-    if not hook_so:
-        return {}
-
-    print(f'[*] relay mode: transparent hook active '
-          f'(port 445 → :{listen_port} → ntlmrelayx → {target_ip}:{target_port})',
+    print('[!] relay mode: proxychains 3.x detected but libproxychains.so.4 not found\n'
+          '[!] Titanis .NET binaries will NOT route through ntlmrelayx\n'
+          '[!] Fix: apt install proxychains4',
           file=sys.stderr)
-    return {'LD_PRELOAD': hook_so}
+    return {}
 
 
 # ── Manual CLI (titan relay-proxy) ────────────────────────────────────────────
@@ -552,12 +392,6 @@ def parse_args():
                    help='ntlmrelayx SOCKS port (default: 1080)')
     p.add_argument('--listen-host', default='127.0.0.1', metavar='HOST')
     p.add_argument('--relay-host', default='127.0.0.1', metavar='HOST')
-    p.add_argument('--target-host', default='', metavar='HOST',
-                   help='Real destination host (transparent mode only)')
-    p.add_argument('--target-port', type=int, default=445, metavar='PORT',
-                   help='Real destination port (transparent mode only, default: 445)')
-    p.add_argument('--transparent', action='store_true',
-                   help='Transparent mode: accept raw TCP, no SOCKS5 client handshake')
     p.add_argument('--quiet', action='store_true')
     return p.parse_args()
 
@@ -566,8 +400,7 @@ def main():
     args = parse_args()
     run_proxy(args.listen_host, args.listen_port,
               args.relay_host, args.relay_port,
-              args.target_host, args.target_port,
-              quiet=args.quiet, transparent=args.transparent)
+              quiet=args.quiet)
 
 
 if __name__ == '__main__':

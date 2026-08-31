@@ -2172,8 +2172,7 @@ def main():
 
     if args.no_pass:
         from titanlib import common, relay_proxy
-        _relay_target = getattr(args, 'target_raw', None) or getattr(args, 'target', '')
-        common._relay_extra_env.update(relay_proxy.activate_relay_mode(target_ip=_relay_target))
+        common._relay_extra_env.update(relay_proxy.activate_relay_mode())
 
     raw   = ([args.target] if args.target else [h.strip() for h in args.file])
     hosts = _expand_hosts(raw)
