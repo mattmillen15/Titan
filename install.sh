@@ -6,10 +6,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 WRAPPER="${BIN_DIR}/titan"
 
-TITANIS_DOWNLOAD_URL="https://github.com/trustedsec/Titanis/releases/download/v0.9.262/Titanis-tools-linux-x64-net8.zip"
-TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
+# Titanis source — fork with MS-TSCH support (schtask subcommand)
+TITANIS_FORK_URL="https://github.com/mattmillen15/Titanis.git"
+TITANIS_FORK_BRANCH="feat/ms-tsch"
+# Upstream release (no schtask support) — uncomment to switch back if merged
+# TITANIS_DOWNLOAD_URL="https://github.com/trustedsec/Titanis/releases/download/v0.9.262/Titanis-tools-linux-x64-net8.zip"
 
-# ── .NET 8 runtime ────────────────────────────────────────────────────────────
+TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
+TITANIS_SRC_DIR="${HOME}/tools/titanis-src"
+
+# ── .NET SDK (needed to build from fork) ─────────────────────────────────────
 
 DOTNET_ROOT_FOUND=""
 
@@ -20,7 +26,6 @@ find_dotnet() {
             echo "${d}"; return 0
         fi
     done
-    # Check /etc/dotnet/install_location
     if [[ -f /etc/dotnet/install_location ]]; then
         loc="$(cat /etc/dotnet/install_location)"
         if ls "${loc}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^8\."; then
@@ -30,32 +35,49 @@ find_dotnet() {
     return 1
 }
 
+find_dotnet_sdk() {
+    local root="${1}"
+    ls "${root}/sdk/" 2>/dev/null | grep -q "^[89]\." && return 0
+    return 1
+}
+
 if DOTNET_ROOT_FOUND="$(find_dotnet)"; then
     echo "[+] .NET runtime: ${DOTNET_ROOT_FOUND}"
 else
-    echo "[*] .NET 8 not found — installing..."
+    echo "[*] .NET 8 not found — installing SDK..."
     command -v curl &>/dev/null || { echo "[!] curl required to install .NET" >&2; exit 1; }
     TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
     curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
     chmod +x "${TMP_DOTNET_INSTALL}"
-    # Strip set -u — hits unbound associative array key on some bash versions
     sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
            -e 's/^set -u$/set +u/' \
            "${TMP_DOTNET_INSTALL}"
-    # dotnet-install.sh uses $() subshells to build download URLs.
-    # If run inside proxychains, "[proxychains] DLL init" messages go to
-    # stderr and get captured into those subshells, corrupting the URL.
-    # Strip LD_PRELOAD so the script runs clean.
-    env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --runtime dotnet --version 8.0.0
+    env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --channel 8.0
     rm -f "${TMP_DOTNET_INSTALL}"
     DOTNET_ROOT_FOUND="${HOME}/.dotnet"
-    echo "[+] .NET 8 installed: ${DOTNET_ROOT_FOUND}"
-    # Register so framework-dependent apps find it without DOTNET_ROOT
+    echo "[+] .NET 8 SDK installed: ${DOTNET_ROOT_FOUND}"
     if mkdir -p /etc/dotnet 2>/dev/null && [[ -w /etc/dotnet ]]; then
         echo "${DOTNET_ROOT_FOUND}" > /etc/dotnet/install_location
         echo "[+] Registered: /etc/dotnet/install_location"
     fi
 fi
+
+# Ensure SDK is available (not just runtime) for building from source
+if ! find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then
+    echo "[*] .NET SDK not found — installing..."
+    TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
+    curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
+    chmod +x "${TMP_DOTNET_INSTALL}"
+    sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
+           -e 's/^set -u$/set +u/' \
+           "${TMP_DOTNET_INSTALL}"
+    env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --channel 8.0
+    rm -f "${TMP_DOTNET_INSTALL}"
+    echo "[+] .NET SDK installed"
+fi
+
+export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
+export PATH="${DOTNET_ROOT_FOUND}:${PATH}"
 
 # ── Titanis binaries ──────────────────────────────────────────────────────────
 
@@ -71,17 +93,17 @@ for candidate in "${TITANIS_PATH:-}" \
 done
 
 if [[ -z "${TITANIS_ROOT}" ]]; then
-    echo "[*] Titanis not found — downloading..."
+    echo "[*] Titanis not found — downloading upstream release..."
     command -v curl  &>/dev/null || { echo "[!] curl required" >&2; exit 1; }
     command -v unzip &>/dev/null || { echo "[!] unzip required" >&2; exit 1; }
 
+    UPSTREAM_URL="https://github.com/trustedsec/Titanis/releases/download/v0.9.262/Titanis-tools-linux-x64-net8.zip"
     TMP_ZIP="/tmp/Titanis-linux-x64-$$.zip"
-    curl -fLk --progress-bar -o "${TMP_ZIP}" "${TITANIS_DOWNLOAD_URL}"
+    curl -fLk --progress-bar -o "${TMP_ZIP}" "${UPSTREAM_URL}"
     mkdir -p "${TITANIS_INSTALL_DIR}"
     unzip -q -o "${TMP_ZIP}" -d "${TITANIS_INSTALL_DIR}"
     rm -f "${TMP_ZIP}"
 
-    # Make ELF binaries executable
     while IFS= read -r -d '' f; do
         case "$(basename "${f}")" in *.so|*.dll|*.pdb|*.json|*.xml|*.md|createdump) continue ;; esac
         file "${f}" 2>/dev/null | grep -q "ELF" && chmod +x "${f}"
@@ -92,6 +114,36 @@ if [[ -z "${TITANIS_ROOT}" ]]; then
 fi
 
 echo "[+] Titanis root: ${TITANIS_ROOT}"
+
+# ── Build Tsch from fork (MS-TSCH support) ───────────────────────────────────
+
+if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
+    echo "[*] Tsch not found — building from fork..."
+    command -v git &>/dev/null || { echo "[!] git required to build Tsch" >&2; exit 1; }
+
+    if [[ -d "${TITANIS_SRC_DIR}/.git" ]]; then
+        echo "[*] Updating fork source..."
+        git -C "${TITANIS_SRC_DIR}" fetch origin
+        git -C "${TITANIS_SRC_DIR}" checkout "${TITANIS_FORK_BRANCH}"
+        git -C "${TITANIS_SRC_DIR}" pull origin "${TITANIS_FORK_BRANCH}"
+    else
+        echo "[*] Cloning fork..."
+        git clone -b "${TITANIS_FORK_BRANCH}" "${TITANIS_FORK_URL}" "${TITANIS_SRC_DIR}"
+    fi
+
+    echo "[*] Building Tsch..."
+    dotnet publish "${TITANIS_SRC_DIR}/tools/rpc/Tsch/Tsch.csproj" \
+        -c Release -o "${TITANIS_ROOT}/Tsch" --nologo -v q 2>&1 | tail -3
+
+    if [[ -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
+        chmod +x "${TITANIS_ROOT}/Tsch/Tsch"
+        echo "[+] Tsch built and installed: ${TITANIS_ROOT}/Tsch/Tsch"
+    else
+        echo "[!] Tsch build failed — check .NET SDK installation" >&2
+    fi
+else
+    echo "[+] Tsch already installed: ${TITANIS_ROOT}/Tsch/Tsch"
+fi
 
 # ── titan wrapper ─────────────────────────────────────────────────────────────
 
@@ -121,4 +173,5 @@ echo "[+] Done. Restart your shell or run: source ~/.zshrc"
 echo ""
 echo "    titan dump -h"
 echo "    titan shell -h"
+echo "    titan schtask -h"
 echo "    titan rbcd -h"

