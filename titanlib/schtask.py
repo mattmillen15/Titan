@@ -134,6 +134,10 @@ def cmd_create(args):
     else:
         print('[!] Specify -c/--command or --xml-file', file=sys.stderr)
         return 1
+    if getattr(args, 'run_as', None):
+        extra += ['-RunAs', args.run_as]
+    if getattr(args, 'logon_type', None):
+        extra += ['-RunAsLogon', args.logon_type]
     if args.update:
         extra += ['-Update']
     out, rc = _tsch('create', auth + [args.target], extra, verbose=args.verbose)
@@ -149,6 +153,10 @@ def cmd_create(args):
 def cmd_run(args):
     auth = _build_auth(args)
     extra = ['-TaskPath', args.name]
+    if getattr(args, 'session_id', None):
+        extra += ['-SessionId', str(args.session_id)]
+    if getattr(args, 'run_as_user', None):
+        extra += ['-RunAsUser', args.run_as_user]
     out, rc = _tsch('run', auth + [args.target], extra, verbose=args.verbose)
     if rc == 0:
         for line in out.splitlines():
@@ -225,6 +233,10 @@ def cmd_exec(args):
     create_extra = ['-TaskPath', task_name, '-Command', args.command]
     if args.arguments:
         create_extra += ['-Arguments', args.arguments]
+    if getattr(args, 'run_as', None):
+        create_extra += ['-RunAs', args.run_as]
+    if getattr(args, 'logon_type', None):
+        create_extra += ['-RunAsLogon', args.logon_type]
     out, rc = _tsch('create', auth + [args.target], create_extra, verbose=args.verbose)
     if rc != 0:
         print(f'[!] Failed to create task (rc={rc})', file=sys.stderr)
@@ -298,6 +310,11 @@ def build_parser():
     c.add_argument('-c', '--command', help='Command to execute')
     c.add_argument('-a', '--arguments', help='Command arguments')
     c.add_argument('--xml-file', help='Task XML file')
+    c.add_argument('--run-as', metavar='DOMAIN\\USER',
+                   help='Run task as this user (default: SYSTEM)')
+    c.add_argument('--logon-type', metavar='TYPE',
+                   choices=['Password', 'S4U', 'InteractiveToken', 'Group', 'ServiceAccount'],
+                   help='Logon type: Password, S4U, InteractiveToken, Group, ServiceAccount')
     c.add_argument('--update', action='store_true', help='Update if exists')
     add_auth_args(c)
     c.add_argument('-v', '--verbose', action='store_true')
@@ -309,6 +326,10 @@ def build_parser():
     r.add_argument('target_string', nargs='?', metavar='[domain/]user[:pass]@host')
     r.add_argument('-t', '--target', metavar='HOST')
     r.add_argument('-n', '--name', required=True, help='Task path')
+    r.add_argument('--session-id', type=int, metavar='ID',
+                   help='Run in this session ID (active RDP session)')
+    r.add_argument('--run-as-user', metavar='DOMAIN\\USER',
+                   help='Run as this user')
     add_auth_args(r)
     r.add_argument('-v', '--verbose', action='store_true')
     r.set_defaults(func=cmd_run)
@@ -360,6 +381,11 @@ def build_parser():
     x.add_argument('-n', '--name', help='Task name (random if omitted)')
     x.add_argument('-c', '--command', required=True, help='Command to execute')
     x.add_argument('-a', '--arguments', help='Command arguments')
+    x.add_argument('--run-as', metavar='DOMAIN\\USER',
+                   help='Run task as this user (default: SYSTEM)')
+    x.add_argument('--logon-type', metavar='TYPE',
+                   choices=['Password', 'S4U', 'InteractiveToken', 'Group', 'ServiceAccount'],
+                   help='Logon type: Password, S4U, InteractiveToken, Group, ServiceAccount')
     x.add_argument('--no-delete', action='store_true',
                    help='Leave task in place after execution')
     add_auth_args(x)
