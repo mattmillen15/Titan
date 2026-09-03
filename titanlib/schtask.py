@@ -69,13 +69,58 @@ def _tsch(subcmd, auth, extra, verbose=False, timeout=60):
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=make_env())
         combined = (r.stderr or '') + (r.stdout or '')
-        return combined, r.returncode
+        rc = r.returncode
+        if 'Tool execution failed' in combined or 'Exception' in combined:
+            rc = rc or 1
+            combined = _clean_error(combined, verbose)
+        else:
+            combined = _strip_noise(combined)
+        return combined, rc
     except subprocess.TimeoutExpired:
         print(f'  [!] Timeout: Tsch {subcmd}', file=sys.stderr)
         return '', 1
     except FileNotFoundError:
         print(f'  [!] Binary not found: {TSCH}', file=sys.stderr)
         return '', 127
+
+
+def _clean_error(raw, verbose=False):
+    if verbose:
+        return raw
+    lines = raw.splitlines()
+    msg = []
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith('Tsch Version') or s.startswith('at '):
+            continue
+        if s.startswith('Tool execution failed'):
+            continue
+        for exc in ('Win32Exception', 'SocketException', 'TschException',
+                    'TimeoutException', 'IOException'):
+            if exc in s:
+                idx = s.index(exc)
+                colon = s.find(':', idx)
+                msg.append(s[colon + 1:].strip() if colon != -1 else s[idx:])
+                return '\n'.join(msg)
+        if 'KDC_ERR' in s or 'ERROR:' in s or 'WARN:' in s:
+            msg.append(s)
+    return '\n'.join(msg) if msg else raw
+
+
+def _strip_noise(raw):
+    lines = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith('INFO:'):
+            s = s[5:].strip()
+        if not s:
+            continue
+        if s.startswith('Tsch Version'):
+            continue
+        if s.startswith('WARN:') and ('Kerberos' in s or 'IP address' in s):
+            continue
+        lines.append(line)
+    return '\n'.join(lines)
 
 
 def _build_auth(args):
