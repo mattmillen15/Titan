@@ -12,8 +12,8 @@ TITANIS_FORK_BRANCH="feat/ms-tsch"
 TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
 TITANIS_SRC_DIR="${HOME}/tools/titanis-src"
 
-DOTNET_CHANNEL="8.0"
-DOTNET_SDK_VER="8.0.424"
+DOTNET_CHANNEL="9.0"
+DOTNET_SDK_VER="9.0.317"
 
 # ── .NET ─────────────────────────────────────────────────────────────────────
 
@@ -22,7 +22,7 @@ DOTNET_ROOT_FOUND=""
 find_dotnet() {
     for d in "${DOTNET_ROOT:-}" "${HOME}/.dotnet" "/usr/share/dotnet" "/usr/local/share/dotnet"; do
         [[ -z "${d}" ]] && continue
-        if ls "${d}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^8\."; then
+        if ls "${d}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^[89]\."; then
             echo "${d}"; return 0
         fi
     done
@@ -31,7 +31,7 @@ find_dotnet() {
 
 find_dotnet_sdk() {
     local root="${1}"
-    ls "${root}/sdk/" 2>/dev/null | grep -q "^[89]\." && return 0
+    ls "${root}/sdk/" 2>/dev/null | grep -q "^9\." && return 0
     return 1
 }
 
@@ -123,8 +123,11 @@ if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
     fi
 
     echo "[*] Building Tsch..."
-    dotnet publish "${TITANIS_SRC_DIR}/tools/rpc/Tsch/Tsch.csproj" \
-        -c Release -o "${TITANIS_ROOT}/Tsch" --nologo -v q 2>&1 | tail -3
+    if ! dotnet publish "${TITANIS_SRC_DIR}/tools/rpc/Tsch/Tsch.csproj" \
+        -c Release -o "${TITANIS_ROOT}/Tsch" --nologo -v q 2>&1 | \
+        grep -v "^$\|warning MSB4011\|warning CS8625\|warning CS0169"; then
+        echo "[!] Tsch build had issues, checking output..." >&2
+    fi
 
     if [[ -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
         chmod +x "${TITANIS_ROOT}/Tsch/Tsch"

