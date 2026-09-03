@@ -55,9 +55,14 @@ def _rand_name():
     return '\\T_' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 
+_PREFER_SMB = False
+
+
 def _tsch(subcmd, auth, extra, verbose=False, timeout=60):
     """Run Tsch binary. Titanis writes data to stderr, so we merge streams."""
     cmd = [TSCH, subcmd] + auth + extra
+    if _PREFER_SMB:
+        cmd.append('-PreferSmb')
     if verbose:
         print(f'  >> {" ".join(cmd)}', file=sys.stderr)
     try:
@@ -297,6 +302,8 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    p.add_argument('--prefer-smb', action='store_true',
+                   help='Route RPC through SMB named pipes (port 445) instead of TCP (port 135)')
     sub = p.add_subparsers(dest='action', help='Action to perform')
 
     # -- query --
@@ -422,9 +429,11 @@ def build_parser():
 
 
 def main():
+    global _PREFER_SMB
     _find_tsch()
     parser = build_parser()
     args = parser.parse_args()
+    _PREFER_SMB = getattr(args, 'prefer_smb', False)
 
     if not args.action:
         parser.print_help()
