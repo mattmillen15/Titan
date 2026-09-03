@@ -62,8 +62,8 @@ else
     fi
 fi
 
-# Ensure SDK is available (not just runtime) for building from source
-if ! find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then
+ensure_dotnet_sdk() {
+    if find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then return 0; fi
     echo "[*] .NET SDK not found — installing..."
     TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
     curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
@@ -74,7 +74,7 @@ if ! find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then
     env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --channel 8.0
     rm -f "${TMP_DOTNET_INSTALL}"
     echo "[+] .NET SDK installed"
-fi
+}
 
 export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
 export PATH="${DOTNET_ROOT_FOUND}:${PATH}"
@@ -119,6 +119,7 @@ echo "[+] Titanis root: ${TITANIS_ROOT}"
 
 if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
     echo "[*] Tsch not found — building from fork..."
+    ensure_dotnet_sdk
     command -v git &>/dev/null || { echo "[!] git required to build Tsch" >&2; exit 1; }
 
     if [[ -d "${TITANIS_SRC_DIR}/.git" ]]; then
