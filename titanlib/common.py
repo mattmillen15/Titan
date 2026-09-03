@@ -44,23 +44,25 @@ def find_binary(name: str):
 
 # ── .NET runtime environment ──────────────────────────────────────────────────
 
-def _has_dotnet8(root: str) -> bool:
+def _has_dotnet(root: str, major: int = 8) -> bool:
     try:
         d = os.path.join(root, 'shared', 'Microsoft.NETCore.App')
-        return any(v.startswith('8.') for v in os.listdir(d))
+        prefix = f'{major}.'
+        return any(v.startswith(prefix) for v in os.listdir(d))
     except OSError:
         return False
 
 
+def _has_dotnet_runtime(root: str) -> bool:
+    return _has_dotnet(root, 8) or _has_dotnet(root, 9)
+
+
 def make_env() -> dict:
-    """Build an environment dict with DOTNET_ROOT set to a .NET 8 installation."""
+    """Build an environment dict with DOTNET_ROOT set to a .NET 8+ installation."""
     env = os.environ.copy()
     dotnet_root = env.get('DOTNET_ROOT', '')
 
-    # Re-search if DOTNET_ROOT is missing, invalid, or doesn't have .NET 8.
-    # This self-heals wrappers written by an older install.sh that picked a
-    # .NET 6 installation (e.g. /usr/share/dotnet) when .NET 8 wasn't yet present.
-    if not dotnet_root or not _has_dotnet8(dotnet_root):
+    if not dotnet_root or not _has_dotnet_runtime(dotnet_root):
         candidates = [
             os.path.expanduser('~/.dotnet'),
             '/usr/share/dotnet',
@@ -75,13 +77,11 @@ def make_env() -> dict:
             except Exception:
                 pass
 
-        # Prefer a root that has .NET 8
         for path in candidates:
-            if path and _has_dotnet8(path):
+            if path and _has_dotnet_runtime(path):
                 dotnet_root = path
                 break
         else:
-            # Fall back to any root with a shared/ dir
             for path in candidates:
                 if path and os.path.isdir(os.path.join(path, 'shared')):
                     dotnet_root = path

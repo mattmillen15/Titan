@@ -70,7 +70,7 @@ def _tsch(subcmd, auth, extra, verbose=False, timeout=60):
                            timeout=timeout, env=make_env())
         combined = (r.stderr or '') + (r.stdout or '')
         rc = r.returncode
-        if 'Tool execution failed' in combined or 'Exception' in combined:
+        if 'Tool execution failed' in combined or '.Exception' in combined:
             rc = rc or 1
             combined = _clean_error(combined, verbose)
         else:
@@ -119,7 +119,7 @@ def _strip_noise(raw):
             continue
         if s.startswith('WARN:') and ('Kerberos' in s or 'IP address' in s):
             continue
-        lines.append(line)
+        lines.append(s)
     return '\n'.join(lines)
 
 
@@ -139,7 +139,7 @@ def _needs_kdc(args):
         return
     if getattr(args, 'ticket_cache', None) or getattr(args, 'tgt', None):
         return
-    host = getattr(args, 'target', None)
+    host = getattr(args, 'target_raw', None) or getattr(args, 'target', None)
     if host:
         args.kdc = host
 
@@ -157,12 +157,7 @@ def cmd_query(args):
         extra += ['-IncludeHidden']
     out, rc = _tsch('query', auth + [args.target], extra, verbose=args.verbose)
     if out:
-        for line in out.splitlines():
-            cleaned = line.strip()
-            if cleaned.startswith('INFO:'):
-                cleaned = cleaned[5:].strip()
-            if cleaned:
-                print(cleaned)
+        print(out)
     return rc
 
 
@@ -171,12 +166,7 @@ def cmd_get(args):
     extra = ['-TaskPath', args.name]
     out, rc = _tsch('get', auth + [args.target], extra, verbose=args.verbose)
     if out:
-        for line in out.splitlines():
-            cleaned = line.strip()
-            if cleaned.startswith('INFO:'):
-                cleaned = cleaned[5:].strip()
-            if cleaned:
-                print(cleaned)
+        print(out)
     return rc
 
 
@@ -275,12 +265,7 @@ def cmd_folders(args):
         extra += ['-Recurse']
     out, rc = _tsch('folders', auth + [args.target], extra, verbose=args.verbose)
     if out:
-        for line in out.splitlines():
-            cleaned = line.strip()
-            if cleaned.startswith('INFO:'):
-                cleaned = cleaned[5:].strip()
-            if cleaned:
-                print(cleaned)
+        print(out)
     return rc
 
 
@@ -308,6 +293,7 @@ def cmd_exec(args):
 
     print(f'[+] Created: {task_name}')
 
+    run_ok = True
     run_as = getattr(args, 'run_as', None)
     if run_as:
         print(f'[*] Task fires via RegistrationTrigger as {run_as}')
@@ -317,14 +303,18 @@ def cmd_exec(args):
         if rc == 0:
             print(f'[+] Executed: {task_name}')
         else:
-            print(f'[!] Run failed (rc={rc})', file=sys.stderr)
+            run_ok = False
+            print(f'[!] Run failed (rc={rc}) — task left for retry: {task_name}',
+                  file=sys.stderr)
+            if out:
+                print(out.strip(), file=sys.stderr)
+            return rc
 
     wait = getattr(args, 'wait', 5)
     if wait > 0 and not args.no_delete:
         print(f'[*] Waiting {wait}s for execution...')
         time.sleep(wait)
 
-    # Delete unless --no-delete
     if not args.no_delete:
         out2, rc2 = _tsch('delete', auth + [args.target], ['-TaskPath', task_name],
                            verbose=args.verbose)

@@ -12,26 +12,25 @@ TITANIS_FORK_BRANCH="tsch"
 TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
 TITANIS_SRC_DIR="${HOME}/tools/titanis-src"
 
-DOTNET_CHANNEL="9.0"
 DOTNET_SDK_VER="9.0.317"
 
 # ── .NET ─────────────────────────────────────────────────────────────────────
 
 DOTNET_ROOT_FOUND=""
 
-find_dotnet() {
+find_dotnet_sdk9() {
+    local root="${1}"
+    [[ -d "${root}/sdk" ]] && ls "${root}/sdk/" 2>/dev/null | grep -q "^9\." && return 0
+    return 1
+}
+
+find_dotnet_runtime() {
     for d in "${DOTNET_ROOT:-}" "${HOME}/.dotnet" "/usr/share/dotnet" "/usr/local/share/dotnet"; do
         [[ -z "${d}" ]] && continue
         if ls "${d}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^[89]\."; then
             echo "${d}"; return 0
         fi
     done
-    return 1
-}
-
-find_dotnet_sdk() {
-    local root="${1}"
-    ls "${root}/sdk/" 2>/dev/null | grep -q "^9\." && return 0
     return 1
 }
 
@@ -55,16 +54,21 @@ install_dotnet_sdk() {
     DOTNET_ROOT_FOUND="${root}"
 }
 
-if DOTNET_ROOT_FOUND="$(find_dotnet)"; then
-    echo "[+] .NET runtime: ${DOTNET_ROOT_FOUND}"
-fi
-
 ensure_dotnet_sdk() {
-    if [[ -n "${DOTNET_ROOT_FOUND}" ]] && find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then
+    if [[ -n "${DOTNET_ROOT_FOUND}" ]] && find_dotnet_sdk9 "${DOTNET_ROOT_FOUND}"; then
+        echo "[+] .NET 9 SDK found: ${DOTNET_ROOT_FOUND}"
         return 0
     fi
     install_dotnet_sdk
 }
+
+if DOTNET_ROOT_FOUND="$(find_dotnet_runtime)"; then
+    echo "[+] .NET runtime: ${DOTNET_ROOT_FOUND}"
+    if ! find_dotnet_sdk9 "${DOTNET_ROOT_FOUND}"; then
+        echo "[*] .NET 9 SDK not at ${DOTNET_ROOT_FOUND}, will install to ~/.dotnet"
+        DOTNET_ROOT_FOUND=""
+    fi
+fi
 
 # ── Titanis binaries ─────────────────────────────────────────────────────────
 
@@ -119,9 +123,13 @@ if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
         git -C "${TITANIS_SRC_DIR}" pull origin "${TITANIS_FORK_BRANCH}"
     else
         echo "[*] Cloning fork..."
-        git clone -b "${TITANIS_FORK_BRANCH}" "${TITANIS_FORK_URL}" "${TITANIS_SRC_DIR}"
+        if ! git clone -b "${TITANIS_FORK_BRANCH}" "${TITANIS_FORK_URL}" "${TITANIS_SRC_DIR}"; then
+            echo "[!] Failed to clone Titanis fork" >&2
+            exit 1
+        fi
     fi
 
+    mkdir -p "${TITANIS_ROOT}/Tsch"
     echo "[*] Building Tsch..."
     if ! dotnet publish "${TITANIS_SRC_DIR}/tools/rpc/Tsch/Tsch.csproj" \
         -c Release -o "${TITANIS_ROOT}/Tsch" --nologo -v q 2>&1 | \
@@ -134,6 +142,7 @@ if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
         echo "[+] Tsch built and installed: ${TITANIS_ROOT}/Tsch/Tsch"
     else
         echo "[!] Tsch build failed — check .NET SDK installation" >&2
+        exit 1
     fi
 else
     echo "[+] Tsch already installed: ${TITANIS_ROOT}/Tsch/Tsch"
@@ -142,7 +151,7 @@ fi
 # ── Set DOTNET_ROOT if not yet set ───────────────────────────────────────────
 
 if [[ -z "${DOTNET_ROOT_FOUND}" ]]; then
-    DOTNET_ROOT_FOUND="$(find_dotnet || echo "${HOME}/.dotnet")"
+    DOTNET_ROOT_FOUND="$(find_dotnet_runtime || echo "${HOME}/.dotnet")"
 fi
 
 export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
