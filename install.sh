@@ -6,16 +6,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 WRAPPER="${BIN_DIR}/titan"
 
-# Titanis source — fork with MS-TSCH support (schtask subcommand)
 TITANIS_FORK_URL="https://github.com/mattmillen15/Titanis.git"
 TITANIS_FORK_BRANCH="feat/ms-tsch"
-# Upstream release (no schtask support) — uncomment to switch back if merged
-# TITANIS_DOWNLOAD_URL="https://github.com/trustedsec/Titanis/releases/download/v0.9.262/Titanis-tools-linux-x64-net8.zip"
 
 TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
 TITANIS_SRC_DIR="${HOME}/tools/titanis-src"
 
-# ── .NET SDK (needed to build from fork) ─────────────────────────────────────
+DOTNET_CHANNEL="8.0"
+DOTNET_SDK_VER="8.0.424"
+
+# ── .NET ─────────────────────────────────────────────────────────────────────
 
 DOTNET_ROOT_FOUND=""
 
@@ -26,12 +26,6 @@ find_dotnet() {
             echo "${d}"; return 0
         fi
     done
-    if [[ -f /etc/dotnet/install_location ]]; then
-        loc="$(cat /etc/dotnet/install_location)"
-        if ls "${loc}/shared/Microsoft.NETCore.App/" 2>/dev/null | grep -q "^8\."; then
-            echo "${loc}"; return 0
-        fi
-    fi
     return 1
 }
 
@@ -41,45 +35,38 @@ find_dotnet_sdk() {
     return 1
 }
 
+install_dotnet_sdk() {
+    local root="${HOME}/.dotnet"
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64)  arch="x64" ;;
+        aarch64) arch="arm64" ;;
+    esac
+    local url="https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_SDK_VER}/dotnet-sdk-${DOTNET_SDK_VER}-linux-${arch}.tar.gz"
+    local tmp="/tmp/dotnet-sdk-$$.tar.gz"
+
+    echo "[*] Downloading .NET SDK ${DOTNET_SDK_VER}..."
+    curl -fLk --progress-bar -o "${tmp}" "${url}"
+    mkdir -p "${root}"
+    tar xzf "${tmp}" -C "${root}"
+    rm -f "${tmp}"
+    echo "[+] .NET SDK installed: ${root}"
+    DOTNET_ROOT_FOUND="${root}"
+}
+
 if DOTNET_ROOT_FOUND="$(find_dotnet)"; then
     echo "[+] .NET runtime: ${DOTNET_ROOT_FOUND}"
-else
-    echo "[*] .NET 8 not found — installing SDK..."
-    command -v curl &>/dev/null || { echo "[!] curl required to install .NET" >&2; exit 1; }
-    TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
-    curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
-    chmod +x "${TMP_DOTNET_INSTALL}"
-    sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
-           -e 's/^set -u$/set +u/' \
-           "${TMP_DOTNET_INSTALL}"
-    env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --channel 8.0
-    rm -f "${TMP_DOTNET_INSTALL}"
-    DOTNET_ROOT_FOUND="${HOME}/.dotnet"
-    echo "[+] .NET 8 SDK installed: ${DOTNET_ROOT_FOUND}"
-    if mkdir -p /etc/dotnet 2>/dev/null && [[ -w /etc/dotnet ]]; then
-        echo "${DOTNET_ROOT_FOUND}" > /etc/dotnet/install_location
-        echo "[+] Registered: /etc/dotnet/install_location"
-    fi
 fi
 
 ensure_dotnet_sdk() {
-    if find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then return 0; fi
-    echo "[*] .NET SDK not found — installing..."
-    TMP_DOTNET_INSTALL="/tmp/dotnet-install-$$.sh"
-    curl -fsSLk https://dot.net/v1/dotnet-install.sh -o "${TMP_DOTNET_INSTALL}"
-    chmod +x "${TMP_DOTNET_INSTALL}"
-    sed -i -e 's/set -euo pipefail/set -eo pipefail/g' \
-           -e 's/^set -u$/set +u/' \
-           "${TMP_DOTNET_INSTALL}"
-    env -u LD_PRELOAD bash "${TMP_DOTNET_INSTALL}" --channel 8.0
-    rm -f "${TMP_DOTNET_INSTALL}"
-    echo "[+] .NET SDK installed"
+    if [[ -n "${DOTNET_ROOT_FOUND}" ]] && find_dotnet_sdk "${DOTNET_ROOT_FOUND}"; then
+        return 0
+    fi
+    install_dotnet_sdk
 }
 
-export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
-export PATH="${DOTNET_ROOT_FOUND}:${PATH}"
-
-# ── Titanis binaries ──────────────────────────────────────────────────────────
+# ── Titanis binaries ─────────────────────────────────────────────────────────
 
 TITANIS_ROOT=""
 for candidate in "${TITANIS_PATH:-}" \
@@ -120,6 +107,9 @@ echo "[+] Titanis root: ${TITANIS_ROOT}"
 if [[ ! -f "${TITANIS_ROOT}/Tsch/Tsch" ]]; then
     echo "[*] Tsch not found — building from fork..."
     ensure_dotnet_sdk
+    export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
+    export PATH="${DOTNET_ROOT_FOUND}:${PATH}"
+
     command -v git &>/dev/null || { echo "[!] git required to build Tsch" >&2; exit 1; }
 
     if [[ -d "${TITANIS_SRC_DIR}/.git" ]]; then
@@ -146,6 +136,15 @@ else
     echo "[+] Tsch already installed: ${TITANIS_ROOT}/Tsch/Tsch"
 fi
 
+# ── Set DOTNET_ROOT if not yet set ───────────────────────────────────────────
+
+if [[ -z "${DOTNET_ROOT_FOUND}" ]]; then
+    DOTNET_ROOT_FOUND="$(find_dotnet || echo "${HOME}/.dotnet")"
+fi
+
+export DOTNET_ROOT="${DOTNET_ROOT_FOUND}"
+export PATH="${DOTNET_ROOT_FOUND}:${PATH}"
+
 # ── titan wrapper ─────────────────────────────────────────────────────────────
 
 mkdir -p "${BIN_DIR}"
@@ -161,7 +160,6 @@ WRAPPER_EOF
 chmod +x "${WRAPPER}"
 echo "[+] Installed: ${WRAPPER}"
 
-# Ensure ~/.local/bin is on PATH
 for rc in "${HOME}/.zshrc" "${HOME}/.bashrc"; do
     if [[ -f "${rc}" ]] && [[ -w "${rc}" ]] && ! grep -q 'local/bin' "${rc}" 2>/dev/null; then
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${rc}"
@@ -175,4 +173,5 @@ echo ""
 echo "    titan dump -h"
 echo "    titan shell -h"
 echo "    titan schtask -h"
+echo "    titan lsassdump -h"
 echo "    titan rbcd -h"
