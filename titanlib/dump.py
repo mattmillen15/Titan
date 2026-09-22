@@ -2239,6 +2239,11 @@ def main():
     args  = parse_args()
     auth  = _auth_args(args)
 
+    if args.target and os.path.isfile(args.target):
+        print(f'[!] -t/--target expects a hostname, not a file.  Use -f/--file {args.target!r}',
+              file=sys.stderr)
+        sys.exit(1)
+
     raw   = ([args.target] if args.target else [h.strip() for h in args.file])
     hosts = _expand_hosts(raw)
 
