@@ -4,6 +4,7 @@
 import argparse
 import csv
 import io
+import json
 import os
 import re
 import subprocess
@@ -225,7 +226,11 @@ def auth_args(args) -> list:
 
 
 def apply_target_string(args, host_attr: str = 'target'):
-    """Parse an impacket-style [[domain/]user[:pass]@]host target string into args."""
+    """Parse an impacket-style [[domain/]user[:pass]@]host target string into args.
+
+    The host portion is stored as-is (no DNS resolution).  Use resolve_host()
+    explicitly if you need a FQDN for Kerberos SPN matching.
+    """
     ts = getattr(args, 'target_string', None)
     if not ts:
         return
@@ -244,12 +249,7 @@ def apply_target_string(args, host_attr: str = 'target'):
                     and not getattr(args, 'ntlm_hash', None):
                 args.password = pw
             if host and not getattr(args, host_attr, None):
-                # Save raw host (IP or hostname as typed) before resolve_host
-                # converts an IP to its reverse-DNS FQDN.  Titanis binaries need
-                # an IPv4 address or a name that resolves to one; the FQDN can
-                # silently get AAAA-only DNS answers and fail to connect.
-                setattr(args, host_attr + '_raw', host)
-                setattr(args, host_attr, resolve_host(host))
+                setattr(args, host_attr, host)
             return
     # No @ — if the string looks like credentials (has / or :) treat it as
     # domain/user:pass with the host coming from -t or -f.
@@ -267,8 +267,7 @@ def apply_target_string(args, host_attr: str = 'target'):
                 args.password = pw
             return
     if not getattr(args, host_attr, None):
-        setattr(args, host_attr + '_raw', ts)
-        setattr(args, host_attr, resolve_host(ts))
+        setattr(args, host_attr, ts)
 
 
 def validate_auth(args, parser, require_cred: bool = True):
@@ -303,7 +302,15 @@ def validate_auth(args, parser, require_cred: bool = True):
 
 
 def resolve_host(host: str) -> str:
-    """Return FQDN for a bare IP; pass hostnames through unchanged."""
+    """Return FQDN for a bare IP; pass hostnames through unchanged.
+
+    NOTE: this is available for explicit use but is NOT called automatically
+    by apply_target_string().  Auto-resolution caused silent connection
+    failures when reverse DNS returned a name that didn't forward-resolve
+    to the same IP, or returned an AAAA-only name that Titanis couldn't
+    connect to.  Callers that need a hostname for Kerberos SPN matching
+    should call this explicitly and handle the failure case.
+    """
     import socket
     if not re.match(r'^[\d.]+$', host) and ':' not in host:
         return host
@@ -311,3 +318,42 @@ def resolve_host(host: str) -> str:
         return socket.gethostbyaddr(host)[0]
     except socket.herror:
         return host
+
+
+def parse_titanis_json(raw: str) -> list:
+    """Parse JSON array output from Titanis, handling common edge cases.
+
+    Titanis sometimes emits error text before/after JSON, truncates the
+    trailing ']', or produces empty output.  This extracts whatever valid
+    JSON objects it can find.
+    """
+    if not raw or not raw.strip():
+        return []
+    text = raw.strip()
+    # Fast path: well-formed JSON array
+    if text.startswith('['):
+        # Fix missing trailing bracket
+        if not text.endswith(']'):
+            text = text.rstrip().rstrip(',') + ']'
+        try:
+            result = json.loads(text)
+            return result if isinstance(result, list) else [result]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Slow path: extract individual JSON objects from mixed output
+    objects = []
+    depth, start = 0, None
+    for i, c in enumerate(text):
+        if c == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    objects.append(json.loads(text[start:i + 1]))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                start = None
+    return objects

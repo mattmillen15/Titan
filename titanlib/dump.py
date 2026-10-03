@@ -53,7 +53,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
-from titanlib.common import find_binary, make_env, run as _common_run
+from titanlib.common import (find_binary, make_env, run as _common_run,
+                             add_auth_args, auth_args, apply_target_string,
+                             validate_auth, parse_titanis_json)
 
 
 def _md4(data: bytes) -> str:
@@ -105,62 +107,6 @@ _BUILTIN_ACCOUNTS = {
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
-def _ccache_principal(args):
-    """Extract username, realm, ticket validity from ccache; fill args if missing."""
-    path = args.ticket_cache or getattr(args, 'tgt', None)
-    if not path:
-        return
-    try:
-        from impacket.krb5.ccache import CCache
-        from datetime import datetime, timezone
-        cc = CCache.loadFile(path)
-        principal = cc.principal
-        if not args.username and principal.components:
-            args.username = principal.components[0]['data'].decode()
-        if not args.domain and principal.realm:
-            args.domain = principal.realm['data'].decode()
-        print(f'[*] ccache principal: {args.username}@{args.domain}', file=sys.stderr)
-        if cc.credentials:
-            t = cc.credentials[0]['time']
-            start_ts = t['starttime'] or t['authtime']
-            end_ts   = t['endtime']
-            now      = datetime.now(tz=timezone.utc)
-            if start_ts:
-                start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-                print(f'[*] ticket issued:  {start_dt.strftime("%Y-%m-%d %H:%M:%S UTC")}',
-                      file=sys.stderr)
-            if end_ts:
-                end_dt  = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-                ttl     = end_dt - now
-                expired = ttl.total_seconds() < 0
-                ttl_str = ('EXPIRED' if expired
-                           else f'expires in {int(ttl.total_seconds() // 3600)}h'
-                                f'{int((ttl.total_seconds() % 3600) // 60)}m')
-                print(f'[*] ticket expiry:  {end_dt.strftime("%Y-%m-%d %H:%M:%S UTC")} ({ttl_str})',
-                      file=sys.stderr)
-    except Exception:
-        pass
-
-
-def _parse_target_string(s):
-    at = s.rfind('@')
-    if at >= 0:
-        host   = s[at + 1:]
-        prefix = s[:at]
-    else:
-        # No @host — treat as credentials-only (host comes from -t / -f)
-        # if the string looks like domain/user:pass or user:pass.
-        # A bare hostname has no / or : so falls through to return None.
-        if '/' not in s and ':' not in s:
-            return None
-        host   = None
-        prefix = s
-    m = re.match(r'^(?:(?P<domain>[^/]+)/)?(?P<user>[^:]+)(?::(?P<password>.*))?$', prefix)
-    if not m:
-        return None
-    return m.group('domain'), m.group('user'), m.group('password'), host
-
-
 def parse_args():
     p = argparse.ArgumentParser(
         prog='titan dump',
@@ -171,31 +117,7 @@ def parse_args():
     p.add_argument('target_string', nargs='?', metavar='[[domain/]user[:pass]@]host',
                    help='impacket-style target string (alternative to -u/-d/-p/-t)')
 
-    auth = p.add_argument_group('Authentication')
-    auth.add_argument('-u', '--username', metavar='USER')
-    auth.add_argument('-d', '--domain', metavar='DOMAIN', default='',
-                      help='Domain name (optional — omit for local account auth)')
-
-    cred = auth.add_mutually_exclusive_group()
-    cred.add_argument('-p', '--password', metavar='PASS')
-    cred.add_argument('--hash', '-hashes', metavar='[LM:]NT', dest='ntlm_hash',
-                      help='NTLM hash for pass-the-hash (LM:NT or just NT). '
-                           '-hashes is the impacket-style alias.')
-    cred.add_argument('--no-pass', '-no-pass', action='store_true', dest='no_pass',
-                      help='No password / empty credential. Use with proxychains for '
-                           'ntlmrelayx --socks relay sessions.')
-
-    kerb = p.add_argument_group('Kerberos')
-    kerb.add_argument('-k', '--kerberos', action='store_true',
-                      help='Use Kerberos auth. Auto-reads KRB5CCNAME env var. '
-                           'Combine with --ccache to override.')
-    kerb.add_argument('-K', '--kdc', '-dc-ip', metavar='HOST[:PORT]', dest='kdc',
-                      help='KDC / domain controller. -dc-ip is the impacket-style alias.')
-    kerb.add_argument('--aes-key', metavar='HEX', help='AES-128/-256 key for Kerberos auth')
-    kerb.add_argument('--ccache', '--ticket-cache', metavar='FILE', dest='ticket_cache',
-                      help='Service ticket ccache (from getST.py/getTGT.py or KRB5CCNAME). '
-                           '--ticket-cache is the legacy alias.')
-    kerb.add_argument('--tgt', metavar='FILE', help='TGT ccache/kirbi file (legacy; prefer --ccache)')
+    add_auth_args(p)
 
     tgt = p.add_argument_group('Target')
     tg = tgt.add_mutually_exclusive_group()
@@ -243,18 +165,7 @@ def parse_args():
 
     args = p.parse_args()
 
-    if args.target_string:
-        parsed = _parse_target_string(args.target_string)
-        if parsed:
-            dom, usr, pw, host = parsed
-            if dom and not args.domain:    args.domain   = dom
-            if usr and not args.username:  args.username = usr
-            if pw is not None and not args.password and not args.ntlm_hash:
-                args.password = pw
-            if host and not args.target:   args.target   = host
-        elif not args.target and '@' not in args.target_string:
-            # Bare hostname (no / or : ) — use as target directly
-            args.target = args.target_string
+    apply_target_string(args)
 
     if args.just_dc_ntlm or args.just_dc_user:
         args.ntds = True
@@ -276,28 +187,12 @@ def parse_args():
     if not (args.target or args.file):
         p.error('target is required (-t, -f, or target string)')
 
-    if args.kerberos and not args.ticket_cache and not args.tgt:
-        env_ccache = os.environ.get('KRB5CCNAME', '')
-        if env_ccache:
-            args.ticket_cache = env_ccache
-            print(f'[*] KRB5CCNAME → {env_ccache}', file=sys.stderr)
-        else:
-            p.error('-k/--kerberos requires KRB5CCNAME to be set or --ccache to be given')
-
-    if args.kerberos and args.ticket_cache and not os.path.isfile(args.ticket_cache):
+    if getattr(args, 'kerberos', False) and getattr(args, 'ticket_cache', None) \
+            and not os.path.isfile(args.ticket_cache):
         p.error(f'ccache file not found: {args.ticket_cache}\n'
                 f'  Run getST.py -spn cifs/<target> ... to obtain a service ticket')
 
-    if args.kerberos and args.ticket_cache and (not args.username or not args.domain):
-        _ccache_principal(args)
-    if not args.username and not args.kerberos:
-        p.error('username is required (-u or target string)')
-
-    has_cred = (args.password or args.ntlm_hash or args.aes_key or
-                args.tgt or args.ticket_cache or args.no_pass)
-    if not has_cred:
-        p.error('provide one of: -p/--password, --hash/-hashes, --aes-key, --ccache/--tgt, '
-                '--no-pass (-k sets --ccache from KRB5CCNAME)')
+    validate_auth(args, p)
 
     if args.ntlm_hash and ':' in args.ntlm_hash:
         args.ntlm_hash = args.ntlm_hash.split(':', 1)[1]
@@ -305,24 +200,6 @@ def parse_args():
     return args
 
 
-def _auth_args(args):
-    """Build Titanis binary auth flags from parsed args."""
-    a = ['-UserName', args.username or '']
-    if args.domain:
-        a += ['-UserDomain', args.domain]
-    elif not getattr(args, 'kerberos', False):
-        a += ['-UserDomain', '.']
-    if args.ntlm_hash:
-        a += ['-NtlmHash', args.ntlm_hash]
-    elif args.password:
-        a += ['-Password', args.password]
-    elif getattr(args, 'no_pass', False):
-        a += ['-NtlmHash', '31d6cfe0d16ae931b73c59d7e0c089c0']  # PtH forces NTLM-only; relay ignores hash
-    if args.kdc:           a += ['-Kdc',         args.kdc]
-    if args.aes_key:       a += ['-AesKey',       args.aes_key]
-    if args.tgt:           a += ['-Tgt',          args.tgt]
-    if args.ticket_cache:  a += ['-TicketCache',  args.ticket_cache]
-    return a
 
 
 # ── Subprocess wrappers ───────────────────────────────────────────────────────
@@ -694,23 +571,8 @@ def _parse_dsrep_json(raw):
                 result.append(h)
         return result
 
-    objects = []
-    depth, start = 0, None
-    for i, c in enumerate(raw):
-        if c == '{':
-            if depth == 0: start = i
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    objects.append(json.loads(raw[start:i + 1]))
-                except Exception:
-                    pass
-                start = None
-
     results = []
-    for obj in objects:
+    for obj in parse_titanis_json(raw):
         sam = obj.get('sAMAccountName', '').replace('\x00', '').strip()
         if not sam:
             continue
@@ -800,12 +662,8 @@ def _smb_ls(unc: str, auth: list, depth: int = 0, verbose: bool = False) -> list
     """List a remote directory. Uses JSON output to avoid dropping hidden/system files."""
     extra = ['-BackupSemantics', '-ConsoleOutputStyle', 'Json', '-Depth', str(depth), unc]
     out, _ = _smb('ls', auth, extra, verbose, timeout=60)
-    try:
-        cleaned = out.rstrip().rstrip(']') + ']'
-        rows = json.loads(cleaned)
-        return [(r.get('RelativePath') or '').strip() for r in rows if r.get('RelativePath')]
-    except (json.JSONDecodeError, TypeError):
-        return []
+    rows = parse_titanis_json(out)
+    return [(r.get('RelativePath') or '').strip() for r in rows if r.get('RelativePath')]
 
 
 def _collect_dpapi_files(host: str, auth: list, workdir: str, verbose: bool) -> dict:
@@ -1048,13 +906,10 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
              'FROM CCM_NetworkAccessAccount',
              '-Namespace', ns, '-ConsoleOutputStyle', 'Json'],
             verbose, timeout=30)
-        if rc != 0 or not raw.strip() or raw.strip() in ('[]', '[]]', '['):
+        if rc != 0:
             continue
-
-        try:
-            cleaned = raw.rstrip().rstrip(']') + ']'
-            rows = json.loads(cleaned)
-        except Exception:
+        rows = parse_titanis_json(raw)
+        if not rows:
             continue
 
         naa = {}
@@ -1096,10 +951,9 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
              'SELECT CollectionVariableName, CollectionVariableValue FROM CCM_CollectionVariable',
              '-Namespace', ns, '-ConsoleOutputStyle', 'Json'],
             verbose, timeout=30)
-        if rc_cv == 0 and raw_cv.strip() not in ('', '[]', '[]]', '['):
+        if rc_cv == 0:
             try:
-                cleaned = raw_cv.rstrip().rstrip(']') + ']'
-                cv_rows = json.loads(cleaned)
+                cv_rows = parse_titanis_json(raw_cv)
                 if cv_rows:
                     out.append('\n[*] SCCM Collection Variables')
                     out.append('-' * 60)
@@ -1119,10 +973,9 @@ def _dump_sccm_naa(host: str, auth: list, masterkeys: dict, out: list, verbose: 
              'FROM CCM_TSEnvironmentVariable',
              '-Namespace', ns, '-ConsoleOutputStyle', 'Json'],
             verbose, timeout=30)
-        if rc_ts == 0 and raw_ts.strip() not in ('', '[]', '[]]', '['):
+        if rc_ts == 0:
             try:
-                cleaned = raw_ts.rstrip().rstrip(']') + ']'
-                ts_rows = json.loads(cleaned)
+                ts_rows = parse_titanis_json(raw_ts)
                 if ts_rows:
                     out.append('\n[*] SCCM Task Sequence Variables')
                     out.append('-' * 60)
@@ -2237,7 +2090,7 @@ def _expand_hosts(raw):
 
 def main():
     args  = parse_args()
-    auth  = _auth_args(args)
+    auth  = auth_args(args)
 
     if args.target and os.path.isfile(args.target):
         print(f'[!] -t/--target expects a hostname, not a file.  Use -f/--file {args.target!r}',
