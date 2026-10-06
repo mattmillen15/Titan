@@ -153,8 +153,9 @@ def add_auth_args(parser):
                            'Combine with --ccache to override the env var.')
     kerb.add_argument('-K', '--kdc', '-dc-ip', metavar='HOST[:PORT]',
                       help='KDC / DC IP or FQDN. -dc-ip is the impacket-style alias.')
-    kerb.add_argument('--aes-key', metavar='HEX',
-                      help='AES-128 or AES-256 key for Kerberos auth')
+    kerb.add_argument('--aes-key', '-aes-key', metavar='HEX',
+                      help='AES-128 or AES-256 key for Kerberos auth (pass-the-key). '
+                           '-aes-key is the impacket-style alias.')
     kerb.add_argument('--ccache', '--ticket-cache', metavar='FILE', dest='ticket_cache',
                       help='Service ticket / TGT ccache file (from getST.py/getTGT.py '
                            'or KRB5CCNAME). --ticket-cache is the legacy alias.')
@@ -272,14 +273,20 @@ def apply_target_string(args, host_attr: str = 'target'):
 
 def validate_auth(args, parser, require_cred: bool = True):
     """Validate auth state; auto-fill ticket_cache from KRB5CCNAME when -k used."""
+    if getattr(args, 'aes_key', None) and not getattr(args, 'kerberos', False):
+        args.kerberos = True
+
     if getattr(args, 'kerberos', False) and not getattr(args, 'ticket_cache', None) \
             and not getattr(args, 'tgt', None):
-        env_ccache = os.environ.get('KRB5CCNAME', '')
-        if env_ccache:
-            args.ticket_cache = env_ccache
-            print(f'[*] KRB5CCNAME → {env_ccache}', file=sys.stderr)
+        if getattr(args, 'aes_key', None):
+            pass
         else:
-            parser.error('-k/--kerberos requires KRB5CCNAME to be set or --ccache to be given')
+            env_ccache = os.environ.get('KRB5CCNAME', '')
+            if env_ccache:
+                args.ticket_cache = env_ccache
+                print(f'[*] KRB5CCNAME → {env_ccache}', file=sys.stderr)
+            else:
+                parser.error('-k/--kerberos requires KRB5CCNAME, --ccache, or --aes-key')
 
     if getattr(args, 'ticket_cache', None) or getattr(args, 'tgt', None):
         ccache_info(args)

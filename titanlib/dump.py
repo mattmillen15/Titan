@@ -1432,15 +1432,31 @@ def _dump_backupkey(host: str, args, auth: list, out: list):
     domain   = auth[auth.index('-UserDomain') + 1] if '-UserDomain' in auth else ''
     password = auth[auth.index('-Password') + 1]   if '-Password'  in auth else ''
     nt_hash  = auth[auth.index('-NtlmHash') + 1]   if '-NtlmHash'  in auth else ''
+    aes_key  = auth[auth.index('-AesKey') + 1]      if '-AesKey'   in auth else ''
     lm_hash  = 'aad3b435b51404eeaad3b435b51404ee'
 
     try:
-        rpc = _transport.SMBTransport(
-            host, 445, r'\lsarpc',
-            username=username, password=password,
-            domain=domain,
-            lmhash=lm_hash if nt_hash else '',
-            nthash=nt_hash)
+        if aes_key or (getattr(args, 'kerberos', False)
+                       and (getattr(args, 'ticket_cache', None)
+                            or getattr(args, 'tgt', None))):
+            from impacket.smbconnection import SMBConnection
+            smb_conn = SMBConnection(host, host, None, 445, timeout=10)
+            tc = getattr(args, 'ticket_cache', None) or getattr(args, 'tgt', None)
+            if tc:
+                os.environ['KRB5CCNAME'] = tc
+            smb_conn.kerberosLogin(username, password, domain,
+                                   '', nt_hash, aes_key,
+                                   getattr(args, 'kdc', None),
+                                   useCache=bool(tc))
+            rpc = _transport.SMBTransport(host, 445, r'\lsarpc')
+            rpc.set_smb_connection(smb_conn)
+        else:
+            rpc = _transport.SMBTransport(
+                host, 445, r'\lsarpc',
+                username=username, password=password,
+                domain=domain,
+                lmhash=lm_hash if nt_hash else '',
+                nthash=nt_hash)
         dce = rpc.get_dce_rpc()
         dce.connect()
         dce.bind(_lsad.MSRPC_UUID_LSAD)

